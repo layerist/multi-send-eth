@@ -1,0 +1,14 @@
+[
+    {
+        "from_address": "0xYourSourceAddress1",
+        "private_key": "YourPrivateKey1",
+        "to_address": "0xDestinationAddress1",
+        "value": 0.1
+    },
+    {
+        "from_address": "0xYourSourceAddress2",
+        "private_key": "YourPrivateKey2",
+        "to_address": "0xDestinationAddress2",
+        "value": 0.2
+    }
+]
