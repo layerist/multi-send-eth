@@ -1,47 +1,78 @@
 import threading
 from web3 import Web3
 import json
+import logging
+import os
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Initialize Web3
-infura_url = "https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID"
+infura_project_id = os.getenv('INFURA_PROJECT_ID')  # Use environment variable for security
+infura_url = f"https://mainnet.infura.io/v3/{infura_project_id}"
 web3 = Web3(Web3.HTTPProvider(infura_url))
 
 if not web3.isConnected():
     raise ConnectionError("Unable to connect to the Ethereum network")
 
-# Function to send ETH
 def send_eth(from_address, private_key, to_address, value):
-    nonce = web3.eth.getTransactionCount(from_address)
-    gas_price = web3.eth.gas_price
-
-    tx = {
-        'nonce': nonce,
-        'to': to_address,
-        'value': web3.toWei(value, 'ether'),
-        'gas': 21000,
-        'gasPrice': gas_price,
-    }
-
-    signed_tx = web3.eth.account.sign_transaction(tx, private_key)
-    tx_hash = web3.eth.send_raw_transaction(signed_tx.rawTransaction)
-    print(f"Transaction sent: {tx_hash.hex()}")
-    receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-    return receipt
-
-# Load wallet data
-with open('wallets.json') as f:
-    wallets = json.load(f)
-
-# Function to handle sending ETH in threads
-def handle_transaction(wallet):
     try:
-        receipt = send_eth(wallet['from_address'], wallet['private_key'], wallet['to_address'], wallet['value'])
-        print(f"Transaction successful with hash: {receipt.transactionHash.hex()}")
-    except Exception as e:
-        print(f"Transaction failed for {wallet['from_address']} to {wallet['to_address']}: {str(e)}")
+        nonce = web3.eth.getTransactionCount(from_address)
+        gas_price = web3.eth.gas_price
 
-# Main function
+        # Create the transaction
+        tx = {
+            'nonce': nonce,
+            'to': to_address,
+            'value': web3.toWei(value, 'ether'),
+            'gas': 21000,
+            'gasPrice': gas_price,
+        }
+
+        # Sign and send the transaction
+        signed_tx = web3.eth.account.sign_transaction(tx, private_key)
+        tx_hash = web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        logging.info(f"Transaction sent: {tx_hash.hex()}")
+
+        # Wait for the transaction receipt
+        receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
+        return receipt
+
+    except Exception as e:
+        logging.error(f"Failed to send transaction from {from_address} to {to_address}: {str(e)}")
+        return None
+
+def load_wallets(file_path):
+    try:
+        with open(file_path) as f:
+            wallets = json.load(f)
+        return wallets
+    except FileNotFoundError:
+        logging.error("The wallets.json file was not found.")
+        return []
+    except json.JSONDecodeError:
+        logging.error("Error decoding JSON from the wallets file.")
+        return []
+
+def handle_transaction(wallet):
+    receipt = send_eth(
+        from_address=wallet['from_address'],
+        private_key=wallet['private_key'],
+        to_address=wallet['to_address'],
+        value=wallet['value']
+    )
+
+    if receipt:
+        logging.info(f"Transaction successful with hash: {receipt.transactionHash.hex()}")
+    else:
+        logging.warning(f"Transaction failed for {wallet['from_address']} to {wallet['to_address']}.")
+
 def main():
+    wallets = load_wallets('wallets.json')
+    if not wallets:
+        logging.error("No wallets to process. Exiting.")
+        return
+
     threads = []
 
     for wallet in wallets:
