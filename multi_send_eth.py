@@ -1,4 +1,4 @@
-import threading
+import concurrent.futures
 from web3 import Web3
 import json
 import logging
@@ -67,21 +67,23 @@ def handle_transaction(wallet):
     else:
         logging.warning(f"Transaction failed for {wallet['from_address']} to {wallet['to_address']}.")
 
+def process_wallets(wallets):
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = {executor.submit(handle_transaction, wallet): wallet for wallet in wallets}
+        for future in concurrent.futures.as_completed(futures):
+            wallet = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                logging.error(f"An error occurred for wallet {wallet['from_address']}: {str(e)}")
+
 def main():
     wallets = load_wallets('wallets.json')
     if not wallets:
         logging.error("No wallets to process. Exiting.")
         return
 
-    threads = []
-
-    for wallet in wallets:
-        thread = threading.Thread(target=handle_transaction, args=(wallet,))
-        threads.append(thread)
-        thread.start()
-
-    for thread in threads:
-        thread.join()
+    process_wallets(wallets)
 
 if __name__ == "__main__":
     main()
