@@ -3,19 +3,33 @@ from web3 import Web3
 import json
 import logging
 import os
+from typing import List, Dict, Optional
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Initialize Web3
-infura_project_id = os.getenv('INFURA_PROJECT_ID')  # Use environment variable for security
+infura_project_id = os.getenv('INFURA_PROJECT_ID')
+if not infura_project_id:
+    logging.critical("INFURA_PROJECT_ID environment variable not set.")
+    exit(1)
+
 infura_url = f"https://mainnet.infura.io/v3/{infura_project_id}"
 web3 = Web3(Web3.HTTPProvider(infura_url))
 
 if not web3.isConnected():
     raise ConnectionError("Unable to connect to the Ethereum network")
 
-def send_eth(from_address, private_key, to_address, value):
+def send_eth(from_address: str, private_key: str, to_address: str, value: float) -> Optional[Dict]:
+    """
+    Send ETH from one address to another.
+
+    :param from_address: Sender's Ethereum address
+    :param private_key: Private key of the sender's address
+    :param to_address: Receiver's Ethereum address
+    :param value: Amount of ETH to send
+    :return: Transaction receipt if successful, None otherwise
+    """
     try:
         nonce = web3.eth.getTransactionCount(from_address)
         gas_price = web3.eth.gas_price
@@ -39,22 +53,33 @@ def send_eth(from_address, private_key, to_address, value):
         return receipt
 
     except Exception as e:
-        logging.error(f"Failed to send transaction from {from_address} to {to_address}: {str(e)}")
+        logging.error(f"Failed to send transaction from {from_address} to {to_address}: {e}")
         return None
 
-def load_wallets(file_path):
+def load_wallets(file_path: str) -> List[Dict]:
+    """
+    Load wallet information from a JSON file.
+
+    :param file_path: Path to the JSON file containing wallet information
+    :return: List of wallets
+    """
     try:
-        with open(file_path) as f:
+        with open(file_path, 'r') as f:
             wallets = json.load(f)
         return wallets
     except FileNotFoundError:
-        logging.error("The wallets.json file was not found.")
+        logging.error(f"The file {file_path} was not found.")
         return []
     except json.JSONDecodeError:
-        logging.error("Error decoding JSON from the wallets file.")
+        logging.error(f"Error decoding JSON from the file {file_path}.")
         return []
 
-def handle_transaction(wallet):
+def handle_transaction(wallet: Dict):
+    """
+    Handle a single transaction based on wallet details.
+
+    :param wallet: Dictionary containing wallet details
+    """
     receipt = send_eth(
         from_address=wallet['from_address'],
         private_key=wallet['private_key'],
@@ -67,7 +92,12 @@ def handle_transaction(wallet):
     else:
         logging.warning(f"Transaction failed for {wallet['from_address']} to {wallet['to_address']}.")
 
-def process_wallets(wallets):
+def process_wallets(wallets: List[Dict]):
+    """
+    Process a list of wallet transactions concurrently.
+
+    :param wallets: List of wallet dictionaries
+    """
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = {executor.submit(handle_transaction, wallet): wallet for wallet in wallets}
         for future in concurrent.futures.as_completed(futures):
@@ -75,7 +105,7 @@ def process_wallets(wallets):
             try:
                 future.result()
             except Exception as e:
-                logging.error(f"An error occurred for wallet {wallet['from_address']}: {str(e)}")
+                logging.error(f"An error occurred for wallet {wallet['from_address']}: {e}")
 
 def main():
     wallets = load_wallets('wallets.json')
