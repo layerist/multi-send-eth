@@ -5,7 +5,7 @@ import logging
 import os
 from typing import List, Dict, Optional
 
-# Configure logging with different levels for development and production
+# Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Initialize Web3 connection using Infura
@@ -22,15 +22,7 @@ if not web3.isConnected():
     exit(1)
 
 def send_eth(from_address: str, private_key: str, to_address: str, value: float) -> Optional[Dict]:
-    """
-    Send ETH from one address to another.
-
-    :param from_address: Sender's Ethereum address
-    :param private_key: Private key of the sender's address
-    :param to_address: Receiver's Ethereum address
-    :param value: Amount of ETH to send (in Ether)
-    :return: Transaction receipt if successful, None otherwise
-    """
+    """Send ETH from one address to another."""
     try:
         nonce = web3.eth.getTransactionCount(from_address)
         gas_price = web3.eth.gas_price
@@ -39,7 +31,7 @@ def send_eth(from_address: str, private_key: str, to_address: str, value: float)
             'nonce': nonce,
             'to': to_address,
             'value': web3.toWei(value, 'ether'),
-            'gas': 21000,  # Standard gas limit for ETH transfer
+            'gas': 21000,
             'gasPrice': gas_price,
         }
 
@@ -50,38 +42,26 @@ def send_eth(from_address: str, private_key: str, to_address: str, value: float)
 
         # Wait for the transaction receipt
         receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-        logging.info(f"Transaction confirmed with receipt: {receipt}")
+        logging.info(f"Transaction confirmed. Receipt: {receipt}")
         return receipt
 
     except Exception as e:
-        logging.error(f"Error sending transaction from {from_address} to {to_address}: {str(e)}")
+        logging.error(f"Error sending transaction from {from_address} to {to_address}: {e}")
         return None
 
 def load_wallets(file_path: str) -> List[Dict]:
-    """
-    Load wallet information from a JSON file.
-
-    :param file_path: Path to the JSON file containing wallet details
-    :return: List of wallet dictionaries
-    """
+    """Load wallet information from a JSON file."""
     try:
         with open(file_path, 'r') as f:
             wallets = json.load(f)
         logging.debug(f"Loaded {len(wallets)} wallets from {file_path}")
         return wallets
-    except FileNotFoundError:
-        logging.error(f"Wallet file not found: {file_path}")
-        return []
-    except json.JSONDecodeError:
-        logging.error(f"Error decoding JSON in wallet file: {file_path}")
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logging.error(f"Error loading wallets from {file_path}: {e}")
         return []
 
 def handle_transaction(wallet: Dict):
-    """
-    Handle a single ETH transaction.
-
-    :param wallet: Dictionary containing wallet details
-    """
+    """Handle a single ETH transaction."""
     try:
         logging.debug(f"Processing transaction from {wallet['from_address']} to {wallet['to_address']}")
         receipt = send_eth(
@@ -97,14 +77,10 @@ def handle_transaction(wallet: Dict):
     except KeyError as e:
         logging.error(f"Missing key in wallet data: {e}")
     except Exception as e:
-        logging.error(f"Error processing transaction for wallet {wallet['from_address']}: {str(e)}")
+        logging.error(f"Error processing transaction for wallet {wallet['from_address']}: {e}")
 
 def process_wallets(wallets: List[Dict]):
-    """
-    Process a list of wallet transactions concurrently.
-
-    :param wallets: List of wallet dictionaries
-    """
+    """Process a list of wallet transactions concurrently."""
     if not wallets:
         logging.warning("No wallets provided for processing.")
         return
@@ -118,7 +94,7 @@ def process_wallets(wallets: List[Dict]):
             try:
                 future.result()
             except Exception as e:
-                logging.error(f"Error handling transaction for wallet {wallet['from_address']}: {str(e)}")
+                logging.error(f"Error handling transaction for wallet {wallet['from_address']}: {e}")
 
 def main():
     wallets = load_wallets('wallets.json')
