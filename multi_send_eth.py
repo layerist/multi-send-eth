@@ -10,18 +10,17 @@ from web3.exceptions import TransactionNotFound
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()],
 )
 
 # Initialize Web3 connection using Infura
-INFURA_PROJECT_ID = os.getenv('INFURA_PROJECT_ID')
+INFURA_PROJECT_ID = os.getenv("INFURA_PROJECT_ID")
 if not INFURA_PROJECT_ID:
     logging.critical("INFURA_PROJECT_ID environment variable is not set.")
     exit(1)
 
 INFURA_URL = f"https://mainnet.infura.io/v3/{INFURA_PROJECT_ID}"
+
 
 def init_web3(provider_url: str) -> Web3:
     """Initialize and return a Web3 instance."""
@@ -31,7 +30,9 @@ def init_web3(provider_url: str) -> Web3:
         exit(1)
     return web3_instance
 
+
 web3 = init_web3(INFURA_URL)
+
 
 def send_eth(from_address: str, private_key: str, to_address: str, value: float) -> Optional[Dict[str, Any]]:
     """
@@ -47,31 +48,30 @@ def send_eth(from_address: str, private_key: str, to_address: str, value: float)
         gas_price = web3.eth.gas_price
 
         tx = {
-            'nonce': nonce,
-            'to': to_address,
-            'value': web3.toWei(value, 'ether'),
-            'gas': 21000,
-            'gasPrice': gas_price,
+            "nonce": nonce,
+            "to": to_address,
+            "value": web3.toWei(value, "ether"),
+            "gas": 21000,
+            "gasPrice": gas_price,
         }
 
-        # Sign and send the transaction
         signed_tx = web3.eth.account.sign_transaction(tx, private_key)
         tx_hash = web3.eth.send_raw_transaction(signed_tx.rawTransaction)
         logging.info(f"Transaction sent. Hash: {tx_hash.hex()}")
 
-        # Wait for the transaction receipt
         receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
         logging.info(f"Transaction confirmed. Receipt: {receipt}")
         return receipt
 
     except ValueError as e:
-        logging.error(f"ValueError encountered while sending ETH: {e}")
-    except TransactionNotFound as e:
-        logging.error(f"Transaction not found: {e}")
+        logging.error(f"ValueError while sending ETH: {e}")
+    except TransactionNotFound:
+        logging.error("Transaction not found after broadcasting.")
     except Exception as e:
         logging.error(f"Unexpected error sending ETH: {e}")
 
     return None
+
 
 def load_wallets(file_path: str) -> List[Dict[str, Any]]:
     """
@@ -80,7 +80,7 @@ def load_wallets(file_path: str) -> List[Dict[str, Any]]:
     :return: List of wallet dictionaries.
     """
     try:
-        with open(file_path, 'r') as f:
+        with open(file_path, "r") as f:
             wallets = json.load(f)
         if not isinstance(wallets, list):
             raise ValueError("JSON file does not contain a list of wallets.")
@@ -90,6 +90,7 @@ def load_wallets(file_path: str) -> List[Dict[str, Any]]:
         logging.error(f"Error loading wallets from {file_path}: {e}")
     return []
 
+
 def handle_transaction(wallet: Dict[str, Any]) -> None:
     """
     Handle a single ETH transaction.
@@ -98,10 +99,10 @@ def handle_transaction(wallet: Dict[str, Any]) -> None:
     try:
         logging.debug(f"Processing transaction from {wallet['from_address']} to {wallet['to_address']}")
         receipt = send_eth(
-            from_address=wallet['from_address'],
-            private_key=wallet['private_key'],
-            to_address=wallet['to_address'],
-            value=wallet['value']
+            from_address=wallet["from_address"],
+            private_key=wallet["private_key"],
+            to_address=wallet["to_address"],
+            value=wallet["value"],
         )
         if receipt:
             logging.info(f"Transaction successful. Hash: {receipt['transactionHash'].hex()}")
@@ -111,6 +112,7 @@ def handle_transaction(wallet: Dict[str, Any]) -> None:
         logging.error(f"Missing key in wallet data: {e}")
     except Exception as e:
         logging.error(f"Error processing transaction for wallet {wallet.get('from_address', 'unknown')}: {e}")
+
 
 def process_wallets(wallets: List[Dict[str, Any]]) -> None:
     """
@@ -131,14 +133,16 @@ def process_wallets(wallets: List[Dict[str, Any]]) -> None:
             except Exception as e:
                 logging.error(f"Error handling transaction for wallet {wallet.get('from_address', 'unknown')}: {e}")
 
+
 def main() -> None:
     """Main function to load wallets and process transactions."""
-    wallets = load_wallets('wallets.json')
+    wallets = load_wallets("wallets.json")
     if not wallets:
         logging.error("No valid wallets found. Exiting.")
         return
 
     process_wallets(wallets)
+
 
 if __name__ == "__main__":
     main()
