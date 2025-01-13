@@ -6,6 +6,9 @@ from typing import List, Dict, Optional, Any
 from web3 import Web3
 from web3.exceptions import TransactionNotFound
 
+# Constants
+DEFAULT_GAS_LIMIT = 21000
+
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -16,7 +19,7 @@ logging.basicConfig(
 # Initialize Web3 connection using Infura
 INFURA_PROJECT_ID = os.getenv("INFURA_PROJECT_ID")
 if not INFURA_PROJECT_ID:
-    logging.critical("INFURA_PROJECT_ID environment variable is not set.")
+    logging.critical("INFURA_PROJECT_ID environment variable is not set. Exiting.")
     exit(1)
 
 INFURA_URL = f"https://mainnet.infura.io/v3/{INFURA_PROJECT_ID}"
@@ -26,7 +29,7 @@ def init_web3(provider_url: str) -> Web3:
     """Initialize and return a Web3 instance."""
     web3_instance = Web3(Web3.HTTPProvider(provider_url))
     if not web3_instance.isConnected():
-        logging.critical("Unable to connect to the Ethereum network.")
+        logging.critical("Unable to connect to the Ethereum network. Exiting.")
         exit(1)
     return web3_instance
 
@@ -51,7 +54,7 @@ def send_eth(from_address: str, private_key: str, to_address: str, value: float)
             "nonce": nonce,
             "to": to_address,
             "value": web3.toWei(value, "ether"),
-            "gas": 21000,
+            "gas": DEFAULT_GAS_LIMIT,
             "gasPrice": gas_price,
         }
 
@@ -68,7 +71,7 @@ def send_eth(from_address: str, private_key: str, to_address: str, value: float)
     except TransactionNotFound:
         logging.error("Transaction not found after broadcasting.")
     except Exception as e:
-        logging.error(f"Unexpected error sending ETH: {e}")
+        logging.error(f"Unexpected error while sending ETH: {e}")
 
     return None
 
