@@ -24,18 +24,15 @@ if not INFURA_PROJECT_ID:
 
 INFURA_URL = f"https://mainnet.infura.io/v3/{INFURA_PROJECT_ID}"
 
-
 def init_web3(provider_url: str) -> Web3:
     """Initialize and return a Web3 instance."""
     web3_instance = Web3(Web3.HTTPProvider(provider_url))
-    if not web3_instance.isConnected():
+    if not web3_instance.is_connected():
         logging.critical("Unable to connect to the Ethereum network. Exiting.")
         exit(1)
     return web3_instance
 
-
 web3 = init_web3(INFURA_URL)
-
 
 def send_eth(from_address: str, private_key: str, to_address: str, value: float) -> Optional[Dict[str, Any]]:
     """
@@ -47,13 +44,13 @@ def send_eth(from_address: str, private_key: str, to_address: str, value: float)
     :return: Transaction receipt or None in case of an error.
     """
     try:
-        nonce = web3.eth.getTransactionCount(from_address)
+        nonce = web3.eth.get_transaction_count(from_address)
         gas_price = web3.eth.gas_price
 
         tx = {
             "nonce": nonce,
             "to": to_address,
-            "value": web3.toWei(value, "ether"),
+            "value": web3.to_wei(value, "ether"),
             "gas": DEFAULT_GAS_LIMIT,
             "gasPrice": gas_price,
         }
@@ -72,9 +69,8 @@ def send_eth(from_address: str, private_key: str, to_address: str, value: float)
         logging.error("Transaction not found after broadcasting.")
     except Exception as e:
         logging.error(f"Unexpected error while sending ETH: {e}")
-
+    
     return None
-
 
 def load_wallets(file_path: str) -> List[Dict[str, Any]]:
     """
@@ -92,7 +88,6 @@ def load_wallets(file_path: str) -> List[Dict[str, Any]]:
     except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
         logging.error(f"Error loading wallets from {file_path}: {e}")
     return []
-
 
 def handle_transaction(wallet: Dict[str, Any]) -> None:
     """
@@ -116,7 +111,6 @@ def handle_transaction(wallet: Dict[str, Any]) -> None:
     except Exception as e:
         logging.error(f"Error processing transaction for wallet {wallet.get('from_address', 'unknown')}: {e}")
 
-
 def process_wallets(wallets: List[Dict[str, Any]]) -> None:
     """
     Process a list of wallet transactions concurrently.
@@ -136,7 +130,6 @@ def process_wallets(wallets: List[Dict[str, Any]]) -> None:
             except Exception as e:
                 logging.error(f"Error handling transaction for wallet {wallet.get('from_address', 'unknown')}: {e}")
 
-
 def main() -> None:
     """Main function to load wallets and process transactions."""
     wallets = load_wallets("wallets.json")
@@ -145,7 +138,6 @@ def main() -> None:
         return
 
     process_wallets(wallets)
-
 
 if __name__ == "__main__":
     main()
