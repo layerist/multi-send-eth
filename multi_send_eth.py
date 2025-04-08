@@ -10,46 +10,36 @@ from web3.exceptions import TransactionNotFound
 # Configuration
 DEFAULT_GAS_LIMIT = int(os.getenv("DEFAULT_GAS_LIMIT", 21000))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", 5))
-RECEIPT_RETRY_DELAY = 2  # Seconds to wait before retrying receipt fetch
-MAX_RECEIPT_RETRIES = 5  # Maximum retries for transaction receipt
+RECEIPT_RETRY_DELAY = 2
+MAX_RECEIPT_RETRIES = 5
 
-# Logging setup
+# Logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()],
+    handlers=[logging.StreamHandler()]
 )
 
-# Infura Web3 connection
+# Web3 setup
 INFURA_PROJECT_ID = os.getenv("INFURA_PROJECT_ID")
 if not INFURA_PROJECT_ID:
     logging.critical("INFURA_PROJECT_ID environment variable is not set. Exiting.")
     exit(1)
 
 INFURA_URL = f"https://mainnet.infura.io/v3/{INFURA_PROJECT_ID}"
+web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 
-
-def get_web3() -> Web3:
-    """Lazy-initialized Web3 instance."""
-    web3_instance = Web3(Web3.HTTPProvider(INFURA_URL))
-    if not web3_instance.is_connected():
-        logging.critical("Failed to connect to Ethereum network. Exiting.")
-        exit(1)
-    return web3_instance
-
-
-web3 = get_web3()
+if not web3.is_connected():
+    logging.critical("Failed to connect to Ethereum network. Exiting.")
+    exit(1)
 
 
 def send_eth(from_address: str, private_key: str, to_address: str, value: float) -> Optional[Dict[str, Any]]:
-    """
-    Send ETH from one address to another with error handling.
-    """
     try:
         nonce = web3.eth.get_transaction_count(from_address)
         gas_price = web3.eth.gas_price
 
-        tx = {
+        transaction = {
             "nonce": nonce,
             "to": to_address,
             "value": web3.to_wei(value, "ether"),
@@ -57,58 +47,55 @@ def send_eth(from_address: str, private_key: str, to_address: str, value: float)
             "gasPrice": gas_price,
         }
 
-        signed_tx = web3.eth.account.sign_transaction(tx, private_key)
+        signed_tx = web3.eth.account.sign_transaction(transaction, private_key)
         tx_hash = web3.eth.send_raw_transaction(signed_tx.rawTransaction)
-        logging.info(f"Transaction sent. Hash: {tx_hash.hex()}")
+        logging.info(f"Transaction sent: {tx_hash.hex()}")
 
-        # Attempt to fetch receipt with retries
-        for attempt in range(MAX_RECEIPT_RETRIES):
+        for attempt in range(1, MAX_RECEIPT_RETRIES + 1):
             try:
                 receipt = web3.eth.get_transaction_receipt(tx_hash)
-                logging.info(f"Transaction confirmed. Hash: {tx_hash.hex()} | Block: {receipt['blockNumber']}")
+                logging.info(f"Transaction confirmed: {tx_hash.hex()} | Block: {receipt['blockNumber']}")
                 return receipt
             except TransactionNotFound:
-                logging.debug(f"Waiting for transaction {tx_hash.hex()} to be mined... (Attempt {attempt+1}/{MAX_RECEIPT_RETRIES})")
+                logging.debug(f"[{attempt}/{MAX_RECEIPT_RETRIES}] Waiting for transaction {tx_hash.hex()} to be mined...")
                 time.sleep(RECEIPT_RETRY_DELAY)
 
-        logging.error(f"Transaction {tx_hash.hex()} not found after retries.")
+        logging.error(f"Transaction {tx_hash.hex()} not confirmed after {MAX_RECEIPT_RETRIES} retries.")
         return None
 
     except ValueError as e:
-        logging.error(f"ValueError while sending ETH from {from_address} to {to_address}: {e}")
+        logging.error(f"ValueError for transaction {from_address} -> {to_address}: {e}")
     except Exception as e:
-        logging.error(f"Unexpected error while sending ETH from {from_address} to {to_address}: {e}")
+        logging.exception(f"Unexpected error for transaction {from_address} -> {to_address}: {e}")
 
     return None
 
 
 def load_wallets(file_path: str) -> List[Dict[str, Any]]:
-    """Load and validate wallet information from a JSON file."""
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            wallets = json.load(f)
+        with open(file_path, "r", encoding="utf-8") as file:
+            wallets = json.load(file)
 
         if not isinstance(wallets, list):
-            raise ValueError("Invalid format: JSON file must contain a list of wallets.")
+            raise ValueError("Expected a list of wallet dictionaries.")
 
         valid_wallets = [
-            wallet for wallet in wallets
-            if {"from_address", "private_key", "to_address", "value"}.issubset(wallet)
+            w for w in wallets if {"from_address", "private_key", "to_address", "value"}.issubset(w)
         ]
 
         if not valid_wallets:
-            logging.warning(f"No valid wallets found in {file_path}. Ensure correct JSON structure.")
+            logging.warning(f"No valid wallets found in {file_path}.")
+        else:
+            logging.info(f"Loaded {len(valid_wallets)} wallets from {file_path}.")
 
-        logging.info(f"Loaded {len(valid_wallets)} valid wallets from {file_path}")
         return valid_wallets
 
     except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
-        logging.error(f"Error loading wallets from {file_path}: {e}")
-    return []
+        logging.error(f"Failed to load wallets: {e}")
+        return []
 
 
-def handle_transaction(wallet: Dict[str, Any]) -> None:
-    """Process a single transaction with error handling."""
+def process_transaction(wallet: Dict[str, Any]) -> None:
     try:
         receipt = send_eth(
             from_address=wallet["from_address"],
@@ -117,38 +104,37 @@ def handle_transaction(wallet: Dict[str, Any]) -> None:
             value=wallet["value"],
         )
         if receipt:
-            logging.info(f"Transaction successful: {receipt['transactionHash'].hex()}")
+            logging.info(f"✅ Success: {receipt['transactionHash'].hex()}")
         else:
-            logging.warning(f"Transaction failed: {wallet['from_address']} -> {wallet['to_address']}")
+            logging.warning(f"❌ Failed: {wallet['from_address']} -> {wallet['to_address']}")
     except Exception as e:
-        logging.error(f"Error processing transaction from {wallet['from_address']}: {e}")
+        logging.exception(f"Exception during transaction: {wallet.get('from_address')} -> {wallet.get('to_address')}")
 
 
-def process_wallets(wallets: List[Dict[str, Any]]) -> None:
-    """Process multiple wallet transactions concurrently."""
+def process_all_wallets(wallets: List[Dict[str, Any]]) -> None:
     if not wallets:
         logging.warning("No wallets to process.")
         return
 
-    logging.info(f"Processing {len(wallets)} transactions with up to {MAX_WORKERS} workers.")
+    logging.info(f"Starting {len(wallets)} transactions using up to {MAX_WORKERS} workers.")
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(handle_transaction, wallet): wallet for wallet in wallets}
+        futures = {executor.submit(process_transaction, wallet): wallet for wallet in wallets}
+
         for future in concurrent.futures.as_completed(futures):
             try:
                 future.result()
             except Exception as e:
                 wallet = futures[future]
-                logging.error(f"Error handling transaction for wallet {wallet.get('from_address', 'unknown')}: {e}")
+                logging.error(f"Unhandled error for wallet {wallet.get('from_address', 'unknown')}: {e}")
 
 
 def main() -> None:
-    """Main function to load wallets and process transactions."""
     wallets = load_wallets("wallets.json")
-    if not wallets:
-        logging.error("No valid wallets found. Exiting.")
-        return
-
-    process_wallets(wallets)
+    if wallets:
+        process_all_wallets(wallets)
+    else:
+        logging.error("No valid wallets to process. Exiting.")
 
 
 if __name__ == "__main__":
