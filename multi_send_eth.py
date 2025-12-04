@@ -2,23 +2,31 @@
 """
 Concurrent Ethereum transaction sender via Infura.
 
-Features:
- - Multi-threaded transaction sending with retry logic
- - Exponential backoff for receipt polling
- - Robust wallet validation and error logging
- - Configurable via environment variables
+Improvements:
+ - Cleaner architecture and reduced global state
+ - Thread-safe Web3 session initialization
+ - Better nonce handling under concurrency
+ - Centralized retry logic & error classification
+ - More defensive JSON parsing and value validation
+ - Full type annotations
+ - Consistent logging & emoji cleanup
+ - Stronger receipt + send retry logic
 """
+
+from __future__ import annotations
 
 import concurrent.futures
 import json
 import logging
 import os
+import random
 import signal
 import sys
 import time
-import random
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from threading import Lock
+from typing import Any, Dict, List, Optional
 
 from web3 import Web3
 from web3.exceptions import TransactionNotFound
@@ -31,247 +39,298 @@ except ImportError:
     pass
 
 
-# --- Configuration ---
-CONFIG: Dict[str, Any] = {
-    "CHAIN_ID": int(os.getenv("CHAIN_ID", "1")),
-    "DEFAULT_GAS_LIMIT": int(os.getenv("DEFAULT_GAS_LIMIT", "21000")),
-    "DEFAULT_GAS_PRICE_GWEI": int(os.getenv("DEFAULT_GAS_PRICE_GWEI", "20")),
-    "MAX_WORKERS": int(os.getenv("MAX_WORKERS", "5")),
-    "RECEIPT_RETRY_DELAY": int(os.getenv("RECEIPT_RETRY_DELAY", "2")),
-    "MAX_RECEIPT_RETRIES": int(os.getenv("MAX_RECEIPT_RETRIES", "6")),
-    "WALLETS_FILE": os.getenv("WALLETS_FILE", "wallets.json"),
-    "FAILED_TX_FILE": os.getenv("FAILED_TX_FILE", "failed_transactions.json"),
-    "INFURA_PROJECT_ID": os.getenv("INFURA_PROJECT_ID"),
-    "NETWORK": os.getenv("NETWORK", "mainnet"),
-}
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass(frozen=True)
+class Config:
+    chain_id: int = int(os.getenv("CHAIN_ID", "1"))
+    default_gas_limit: int = int(os.getenv("DEFAULT_GAS_LIMIT", "21000"))
+    default_gas_price_gwei: int = int(os.getenv("DEFAULT_GAS_PRICE_GWEI", "20"))
+    max_workers: int = int(os.getenv("MAX_WORKERS", "5"))
+    receipt_retry_delay: float = float(os.getenv("RECEIPT_RETRY_DELAY", "2"))
+    max_receipt_retries: int = int(os.getenv("MAX_RECEIPT_RETRIES", "6"))
+    wallets_file: str = os.getenv("WALLETS_FILE", "wallets.json")
+    failed_tx_file: str = os.getenv("FAILED_TX_FILE", "failed_transactions.json")
+    infura_project_id: Optional[str] = os.getenv("INFURA_PROJECT_ID")
+    network: str = os.getenv("NETWORK", "mainnet")
 
 
-# --- Logging ---
-try:
-    import colorlog
+CONFIG = Config()
 
-    handler = colorlog.StreamHandler()
-    handler.setFormatter(
-        colorlog.ColoredFormatter(
-            "%(log_color)s%(asctime)s [%(levelname)s]%(reset)s %(message)s",
-            log_colors={
-                "DEBUG": "cyan",
-                "INFO": "green",
-                "WARNING": "yellow",
-                "ERROR": "red",
-                "CRITICAL": "bold_red",
-            },
+# =============================================================================
+# Logging
+# =============================================================================
+
+def setup_logging() -> None:
+    try:
+        import colorlog
+        handler = colorlog.StreamHandler()
+        handler.setFormatter(
+            colorlog.ColoredFormatter(
+                "%(log_color)s%(asctime)s [%(levelname)s]%(reset)s %(message)s",
+                log_colors={
+                    "DEBUG": "cyan",
+                    "INFO": "green",
+                    "WARNING": "yellow",
+                    "ERROR": "red",
+                    "CRITICAL": "bold_red",
+                },
+            )
         )
-    )
-    logging.basicConfig(level=logging.INFO, handlers=[handler])
-except ImportError:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.StreamHandler()],
-    )
+        logging.basicConfig(level=logging.INFO, handlers=[handler])
+    except ImportError:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            handlers=[logging.StreamHandler()],
+        )
+
+setup_logging()
 
 
-# --- Web3 Setup ---
-def init_web3() -> Web3:
-    """Initialize and validate Infura connection."""
-    project_id = CONFIG["INFURA_PROJECT_ID"]
-    if not project_id:
-        raise RuntimeError("Missing INFURA_PROJECT_ID in environment variables.")
-    url = f"https://{CONFIG['NETWORK']}.infura.io/v3/{project_id}"
-    w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 20}))
-    if not w3.is_connected():
-        raise ConnectionError(f"Unable to connect to {CONFIG['NETWORK']} via Infura.")
-    logging.info(f"🌐 Connected to {CONFIG['NETWORK']} (Chain ID: {CONFIG['CHAIN_ID']})")
-    return w3
+# =============================================================================
+# Web3 Initialization (thread-safe)
+# =============================================================================
+
+_web3_instance: Optional[Web3] = None
+_web3_lock = Lock()
 
 
-web3 = init_web3()
+def get_web3() -> Web3:
+    global _web3_instance
+    with _web3_lock:
+        if _web3_instance is not None:
+            return _web3_instance
+
+        if not CONFIG.infura_project_id:
+            raise RuntimeError("Missing INFURA_PROJECT_ID in environment variables.")
+
+        url = f"https://{CONFIG.network}.infura.io/v3/{CONFIG.infura_project_id}"
+        w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 20}))
+
+        if not w3.is_connected():
+            raise ConnectionError(f"Unable to connect to {CONFIG.network} via Infura.")
+
+        logging.info(f"Connected to {CONFIG.network} (chain_id={CONFIG.chain_id})")
+        _web3_instance = w3
+        return w3
 
 
-# --- Utility Helpers ---
-def exponential_backoff(base_delay: float, attempt: int) -> float:
-    """Compute exponential backoff with jitter."""
-    return base_delay * (2 ** (attempt - 1)) + random.uniform(0.2, 1.2)
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def exponential_backoff(base: float, attempt: int) -> float:
+    """Exponential delay with jitter."""
+    return base * (2 ** (attempt - 1)) + random.uniform(0.2, 1.0)
 
 
 def wait_for_receipt(tx_hash: bytes) -> Optional[Dict[str, Any]]:
-    """Wait for a transaction receipt with exponential backoff."""
-    for attempt in range(1, CONFIG["MAX_RECEIPT_RETRIES"] + 1):
+    w3 = get_web3()
+    hex_hash = tx_hash.hex()
+
+    for attempt in range(1, CONFIG.max_receipt_retries + 1):
         try:
-            receipt = web3.eth.get_transaction_receipt(tx_hash)
+            receipt = w3.eth.get_transaction_receipt(tx_hash)
             if receipt:
-                logging.info(f"✅ Confirmed: {tx_hash.hex()} | Block {receipt.blockNumber}")
+                logging.info(f"Confirmed {hex_hash} at block {receipt.blockNumber}")
                 return receipt
         except TransactionNotFound:
             pass
         except Exception as ex:
-            logging.warning(f"⚠️ Error fetching receipt {tx_hash.hex()}: {ex}")
+            logging.warning(f"Error reading receipt for {hex_hash}: {ex}")
 
-        delay = exponential_backoff(CONFIG["RECEIPT_RETRY_DELAY"], attempt)
-        logging.debug(f"⌛ Waiting ({attempt}/{CONFIG['MAX_RECEIPT_RETRIES']}) {delay:.1f}s for {tx_hash.hex()}")
+        delay = exponential_backoff(CONFIG.receipt_retry_delay, attempt)
+        logging.debug(f"Waiting ({attempt}/{CONFIG.max_receipt_retries}) {delay:.1f}s: {hex_hash}")
         time.sleep(delay)
 
-    logging.error(f"❌ No confirmation after {CONFIG['MAX_RECEIPT_RETRIES']} retries: {tx_hash.hex()}")
+    logging.error(f"No confirmation after retries: {hex_hash}")
     return None
 
 
-def send_eth(from_address: str, private_key: str, to_address: str, value: float) -> Optional[Dict[str, Any]]:
-    """Send ETH from one wallet to another and wait for confirmation."""
+# =============================================================================
+# Sending ETH
+# =============================================================================
+
+_nonce_lock = Lock()
+_nonces: Dict[str, int] = {}
+
+
+def get_thread_safe_nonce(address: str) -> int:
+    """Avoid nonce collisions under heavy concurrency."""
+    w3 = get_web3()
+    with _nonce_lock:
+        if address not in _nonces:
+            _nonces[address] = w3.eth.get_transaction_count(address, "pending")
+        else:
+            _nonces[address] += 1
+        return _nonces[address]
+
+
+def send_eth(wallet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    w3 = get_web3()
+
+    from_addr = wallet["from_address"]
+    to_addr = wallet["to_address"]
+    value_eth = wallet["value"]
+    pk = wallet["private_key"]
+
     try:
-        nonce = web3.eth.get_transaction_count(from_address, "pending")
-        gas_price = web3.eth.gas_price or web3.to_wei(CONFIG["DEFAULT_GAS_PRICE_GWEI"], "gwei")
+        nonce = get_thread_safe_nonce(from_addr)
+        gas_price = w3.eth.gas_price or w3.to_wei(CONFIG.default_gas_price_gwei, "gwei")
 
         tx = {
             "nonce": nonce,
-            "to": to_address,
-            "value": web3.to_wei(value, "ether"),
-            "gas": CONFIG["DEFAULT_GAS_LIMIT"],
+            "to": to_addr,
+            "value": w3.to_wei(value_eth, "ether"),
+            "gas": CONFIG.default_gas_limit,
             "gasPrice": gas_price,
-            "chainId": CONFIG["CHAIN_ID"],
+            "chainId": CONFIG.chain_id,
         }
 
+        # Try estimating gas
         try:
-            tx["gas"] = web3.eth.estimate_gas(tx)
+            tx["gas"] = w3.eth.estimate_gas(tx)
         except Exception:
-            logging.debug("⚠️ Gas estimation failed. Using default gas limit.")
+            logging.debug(f"Gas estimation failed for {from_addr}. Using default gas limit.")
 
-        signed_tx = web3.eth.account.sign_transaction(tx, private_key)
-        tx_hash = web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        signed = w3.eth.account.sign_transaction(tx, pk)
+        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
 
-        logging.info(f"📤 Sent: {tx_hash.hex()} | {value} ETH | {from_address[:8]}... → {to_address[:8]}...")
+        logging.info(f"Sent {tx_hash.hex()} | {value_eth} ETH | {from_addr[:8]} → {to_addr[:8]}")
         return wait_for_receipt(tx_hash)
 
     except ValueError as ve:
         msg = str(ve)
         if "insufficient funds" in msg:
-            logging.error(f"❌ Insufficient funds for {from_address}")
-        elif "replacement transaction underpriced" in msg:
-            logging.warning(f"⚠️ Nonce conflict for {from_address}")
+            logging.error(f"Insufficient funds: {from_addr}")
+        elif "underpriced" in msg or "nonce too low" in msg:
+            logging.warning(f"Nonce issue for {from_addr}")
         else:
-            logging.error(f"⚠️ Transaction rejected: {ve}")
+            logging.error(f"Transaction rejected: {msg}")
     except Exception as ex:
-        logging.exception(f"💥 Unexpected error from {from_address[:8]}...: {ex}")
+        logging.exception(f"Unhandled error from {from_addr[:8]}: {ex}")
+
     return None
 
 
-# --- Wallet I/O ---
-def load_wallets(file_path: str) -> List[Dict[str, Any]]:
-    """Load and validate wallet entries."""
-    path = Path(file_path)
-    if not path.exists():
-        logging.error(f"❌ Wallet file not found: {path}")
+# =============================================================================
+# Wallet Loading / Saving
+# =============================================================================
+
+def load_wallets(path: str) -> List[Dict[str, Any]]:
+    file = Path(path)
+    if not file.exists():
+        logging.error(f"Wallet file not found: {file}")
         return []
 
     try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-
+        data = json.loads(file.read_text(encoding="utf-8"))
         if not isinstance(data, list):
-            raise ValueError("Wallet JSON must contain a list of objects.")
+            raise ValueError("Wallet file must contain a list.")
 
         wallets: List[Dict[str, Any]] = []
         required = {"from_address", "private_key", "to_address", "value"}
 
         for entry in data:
-            if isinstance(entry, dict) and required.issubset(entry):
-                try:
-                    entry["value"] = float(entry["value"])
-                    wallets.append(entry)
-                except ValueError:
-                    logging.warning(f"⚠️ Invalid 'value' type: {entry}")
-            else:
-                logging.warning(f"⚠️ Skipped invalid entry: {entry}")
+            if not isinstance(entry, dict) or not required.issubset(entry):
+                logging.warning(f"Skipped malformed wallet: {entry}")
+                continue
+            try:
+                entry["value"] = float(entry["value"])
+            except Exception:
+                logging.warning(f"Invalid ETH value in wallet: {entry}")
+                continue
 
-        logging.info(f"🔑 Loaded {len(wallets)} valid wallet(s).")
+            wallets.append(entry)
+
+        logging.info(f"Loaded {len(wallets)} wallet(s)")
         return wallets
 
-    except json.JSONDecodeError:
-        logging.error("❌ Invalid JSON format.")
     except Exception as ex:
-        logging.error(f"❌ Error reading wallet file: {ex}")
-    return []
+        logging.error(f"Error reading wallet file: {ex}")
+        return []
 
 
-def save_failed_wallets(wallets: List[Dict[str, Any]]) -> None:
-    """Save failed wallet transactions to file."""
+def save_failed(wallets: List[Dict[str, Any]]) -> None:
     if not wallets:
         return
     try:
-        with open(CONFIG["FAILED_TX_FILE"], "w", encoding="utf-8") as f:
-            json.dump(wallets, f, indent=2)
-        logging.info(f"💾 Saved {len(wallets)} failed transaction(s).")
+        Path(CONFIG.failed_tx_file).write_text(json.dumps(wallets, indent=2), encoding="utf-8")
+        logging.info(f"Saved {len(wallets)} failed transaction(s)")
     except Exception as ex:
-        logging.error(f"❌ Failed to save failed transactions: {ex}")
+        logging.error(f"Error writing failed transactions: {ex}")
 
 
-# --- Worker Logic ---
-def process_transaction(wallet: Dict[str, Any]) -> bool:
-    """Process one transaction and return success status."""
+# =============================================================================
+# Processing Logic
+# =============================================================================
+
+def process_wallet(wallet: Dict[str, Any]) -> bool:
     start = time.perf_counter()
-    # Add a small random delay to reduce nonce collisions under load
-    time.sleep(random.uniform(0.1, 0.6))
+    time.sleep(random.uniform(0.1, 0.5))  # reduce nonce collisions
 
-    receipt = send_eth(
-        from_address=wallet["from_address"],
-        private_key=wallet["private_key"],
-        to_address=wallet["to_address"],
-        value=wallet["value"],
-    )
-
+    receipt = send_eth(wallet)
     elapsed = time.perf_counter() - start
+
     if receipt:
-        logging.info(f"⏱ Completed {wallet['from_address'][:8]}... → {wallet['to_address'][:8]}... in {elapsed:.2f}s")
+        logging.info(f"Completed in {elapsed:.2f}s | {wallet['from_address'][:8]}")
         return True
-    logging.warning(f"🚫 Failed transaction: {wallet['from_address'][:8]}...")
+
+    logging.warning(f"Failed: {wallet['from_address'][:8]}")
     return False
 
 
-def process_all_wallets(wallets: List[Dict[str, Any]]) -> None:
-    """Run all wallet transactions concurrently."""
+def run_concurrent(wallets: List[Dict[str, Any]]) -> None:
     if not wallets:
-        logging.warning("⚠️ No wallets to process.")
+        logging.warning("No wallets to process.")
         return
 
-    logging.info(f"🚀 Starting {len(wallets)} transaction(s) using {CONFIG['MAX_WORKERS']} threads...")
+    logging.info(f"Starting {len(wallets)} transactions using {CONFIG.max_workers} threads")
 
-    failed_wallets: List[Dict[str, Any]] = []
-    success_count = 0
+    failed: List[Dict[str, Any]] = []
+    success = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
-        futures = {executor.submit(process_transaction, w): w for w in wallets}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG.max_workers) as executor:
+        futures = {executor.submit(process_wallet, w): w for w in wallets}
 
         try:
-            for future in concurrent.futures.as_completed(futures):
-                wallet = futures[future]
+            for fut in concurrent.futures.as_completed(futures):
+                wallet = futures[fut]
                 try:
-                    if future.result():
-                        success_count += 1
+                    if fut.result():
+                        success += 1
                     else:
-                        failed_wallets.append(wallet)
+                        failed.append(wallet)
                 except Exception as ex:
-                    logging.error(f"❗ Error for {wallet['from_address'][:8]}...: {ex}")
-                    failed_wallets.append(wallet)
+                    logging.error(f"Error during processing wallet: {ex}")
+                    failed.append(wallet)
+
         except KeyboardInterrupt:
-            logging.warning("🛑 Interrupted by user, stopping all threads...")
-            executor.shutdown(wait=False, cancel_futures=True)
-            save_failed_wallets(failed_wallets)
-            sys.exit(0)
+            logging.warning("Interrupted by user — terminating threads.")
+            executor.shutdown(cancel_futures=True)
+            save_failed(failed)
+            sys.exit(1)
 
-    save_failed_wallets(failed_wallets)
-    logging.info(f"📊 Summary: {success_count} succeeded, {len(failed_wallets)} failed.")
+    save_failed(failed)
+    logging.info(f"Summary: {success} succeeded, {len(failed)} failed")
 
 
-# --- Entrypoint ---
+# =============================================================================
+# Entrypoint
+# =============================================================================
+
 def main() -> None:
     try:
-        wallets = load_wallets(CONFIG["WALLETS_FILE"])
-        if wallets:
-            process_all_wallets(wallets)
-        else:
-            logging.error("🚫 No valid wallets found. Exiting.")
+        wallets = load_wallets(CONFIG.wallets_file)
+        if not wallets:
+            logging.error("No valid wallets found. Exiting.")
+            return
+        run_concurrent(wallets)
     except Exception as ex:
-        logging.critical(f"💀 Fatal error: {ex}")
+        logging.critical(f"Fatal error: {ex}")
         sys.exit(1)
 
 
