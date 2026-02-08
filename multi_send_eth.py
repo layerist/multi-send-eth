@@ -2,13 +2,12 @@
 """
 Concurrent Ethereum transaction sender via Infura (production-grade).
 
-Improvements:
-- Strict wallet validation (address + private key)
-- Thread-safe nonce manager with reset-on-error
-- Robust EIP-1559 fee handling with caps
-- Centralized retry & error classification
-- Graceful shutdown support
-- Atomic failed-tx persistence
+Design goals:
+- Deterministic nonce management across threads
+- Explicit EIP-1559 fee control with safety caps
+- Clear error classification (retryable vs fatal)
+- Graceful shutdown without orphan workers
+- Atomic persistence of failed transactions
 """
 
 from __future__ import annotations
@@ -19,9 +18,9 @@ import logging
 import os
 import random
 import signal
-import sys
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Dict, List, Optional
@@ -49,7 +48,7 @@ class Config:
     network: str = os.getenv("NETWORK", "mainnet")
 
     default_gas_limit: int = int(os.getenv("DEFAULT_GAS_LIMIT", "21000"))
-    default_gas_price_gwei: int = int(os.getenv("DEFAULT_GAS_PRICE_GWEI", "20"))
+    fallback_gas_price_gwei: int = int(os.getenv("DEFAULT_GAS_PRICE_GWEI", "20"))
 
     max_priority_fee_gwei: int = int(os.getenv("MAX_PRIORITY_FEE_GWEI", "3"))
     max_fee_multiplier: int = int(os.getenv("MAX_FEE_MULTIPLIER", "2"))
@@ -102,7 +101,7 @@ setup_logging()
 
 
 # =============================================================================
-# Web3 singleton
+# Web3 Singleton
 # =============================================================================
 
 _web3: Optional[Web3] = None
@@ -134,13 +133,35 @@ def get_web3() -> Web3:
 # =============================================================================
 
 def backoff(base: float, attempt: int) -> float:
-    return base * (2 ** (attempt - 1)) + random.uniform(0.1, 0.7)
+    return base * (2 ** (attempt - 1)) + random.uniform(0.1, 0.6)
 
 
 def atomic_write(path: Path, data: str) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(data, encoding="utf-8")
     tmp.replace(path)
+
+
+# =============================================================================
+# Error Classification
+# =============================================================================
+
+class TxError(Enum):
+    RETRYABLE = "retryable"
+    NONCE = "nonce"
+    INSUFFICIENT_FUNDS = "insufficient_funds"
+    FATAL = "fatal"
+
+
+def classify_error(exc: Exception) -> TxError:
+    msg = str(exc).lower()
+    if "nonce too low" in msg or "replacement transaction underpriced" in msg:
+        return TxError.NONCE
+    if "insufficient funds" in msg:
+        return TxError.INSUFFICIENT_FUNDS
+    if "timeout" in msg or "connection" in msg:
+        return TxError.RETRYABLE
+    return TxError.FATAL
 
 
 # =============================================================================
@@ -152,7 +173,7 @@ class NonceManager:
         self._lock = Lock()
         self._nonces: Dict[str, int] = {}
 
-    def next(self, address: str) -> int:
+    def reserve(self, address: str) -> int:
         w3 = get_web3()
         with self._lock:
             if address not in self._nonces:
@@ -205,27 +226,26 @@ def build_tx(wallet: Dict[str, Any]) -> Dict[str, Any]:
     w3 = get_web3()
 
     tx: Dict[str, Any] = {
-        "nonce": NONCES.next(wallet["from_address"]),
+        "nonce": NONCES.reserve(wallet["from_address"]),
         "to": wallet["to_address"],
         "value": w3.to_wei(wallet["value"], "ether"),
         "chainId": CONFIG.chain_id,
     }
 
-    # Prefer EIP-1559
+    # EIP-1559 preferred
     try:
         block = w3.eth.get_block("latest")
-        base_fee = block.get("baseFeePerGas")
-        if base_fee is None:
-            raise ValueError
-
+        base_fee = block["baseFeePerGas"]
         priority = w3.to_wei(CONFIG.max_priority_fee_gwei, "gwei")
+
+        max_fee = base_fee * CONFIG.max_fee_multiplier + priority
         tx.update({
             "type": 2,
             "maxPriorityFeePerGas": priority,
-            "maxFeePerGas": base_fee * CONFIG.max_fee_multiplier + priority,
+            "maxFeePerGas": max_fee,
         })
     except Exception:
-        tx["gasPrice"] = w3.to_wei(CONFIG.default_gas_price_gwei, "gwei")
+        tx["gasPrice"] = w3.to_wei(CONFIG.fallback_gas_price_gwei, "gwei")
 
     try:
         tx["gas"] = w3.eth.estimate_gas(tx)
@@ -258,22 +278,25 @@ def send_eth(wallet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
             return wait_for_receipt(tx_hash)
 
-        except ValueError as ve:
-            msg = str(ve).lower()
-            if "insufficient funds" in msg:
+        except Exception as exc:
+            category = classify_error(exc)
+
+            if category is TxError.INSUFFICIENT_FUNDS:
                 logging.error(f"Insufficient funds: {addr}")
                 return None
-            if "nonce too low" in msg or "replacement transaction underpriced" in msg:
+
+            if category is TxError.NONCE:
                 logging.warning(f"Nonce conflict, resetting nonce ({addr})")
                 NONCES.reset(addr)
-            else:
-                logging.error(f"Rejected tx ({addr}): {ve}")
+
+            if category is TxError.FATAL:
+                logging.error(f"Fatal tx error ({addr}): {exc}")
                 return None
 
-        except Exception as exc:
-            logging.warning(f"Send error ({addr}, attempt {attempt}): {exc}")
-
-        time.sleep(backoff(1.0, attempt))
+            logging.warning(
+                f"Retryable error ({addr}, attempt {attempt}): {exc}"
+            )
+            time.sleep(backoff(1.0, attempt))
 
     return None
 
@@ -295,25 +318,22 @@ def load_wallets(path: str) -> List[Dict[str, Any]]:
     w3 = get_web3()
 
     try:
-        data = json.loads(file.read_text("utf-8"))
-        if not isinstance(data, list):
+        raw = json.loads(file.read_text("utf-8"))
+        if not isinstance(raw, list):
             raise ValueError("Wallet file must contain a list")
 
-        for w in data:
+        for w in raw:
             if not isinstance(w, dict) or not REQUIRED_FIELDS.issubset(w):
-                logging.warning(f"Invalid wallet skipped: {w}")
                 continue
-
             try:
-                w["from_address"] = w3.to_checksum_address(w["from_address"])
-                w["to_address"] = w3.to_checksum_address(w["to_address"])
-                w["value"] = float(w["value"])
-                assert len(w["private_key"]) >= 64
+                wallets.append({
+                    "from_address": w3.to_checksum_address(w["from_address"]),
+                    "to_address": w3.to_checksum_address(w["to_address"]),
+                    "private_key": w["private_key"],
+                    "value": float(w["value"]),
+                })
             except Exception:
-                logging.warning(f"Invalid wallet data skipped: {w}")
-                continue
-
-            wallets.append(w)
+                logging.warning(f"Invalid wallet skipped: {w}")
 
     except Exception as exc:
         logging.error(f"Wallet parse error: {exc}")
@@ -389,7 +409,6 @@ def main() -> None:
 def _graceful_exit(*_: object) -> None:
     logging.warning("Shutdown signal received")
     STOP_EVENT.set()
-    sys.exit(0)
 
 
 if __name__ == "__main__":
