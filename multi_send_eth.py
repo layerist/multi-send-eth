@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Concurrent Ethereum transaction sender via Infura (production-grade).
+Concurrent Ethereum transaction sender via Infura (production-grade hardened).
 
-Design goals:
-- Deterministic nonce management across threads
-- Explicit EIP-1559 fee control with safety caps
-- Clear error classification (retryable vs fatal)
-- Graceful shutdown without orphan workers
-- Atomic persistence of failed transactions
+Improvements:
+- Decimal-based ETH handling (no float precision loss)
+- Safer EIP-1559 fee escalation for replacements
+- Strict retry separation (build/send/receipt)
+- Nonce resync with pending pool awareness
+- Clean shutdown propagation
+- Deterministic failure persistence
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import random
 import signal
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from threading import Event, Lock
@@ -27,15 +29,6 @@ from typing import Any, Dict, List, Optional
 
 from web3 import Web3
 from web3.exceptions import TransactionNotFound
-
-# -----------------------------------------------------------------------------
-# Optional dotenv
-# -----------------------------------------------------------------------------
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
 
 
 # =============================================================================
@@ -48,16 +41,16 @@ class Config:
     network: str = os.getenv("NETWORK", "mainnet")
 
     default_gas_limit: int = int(os.getenv("DEFAULT_GAS_LIMIT", "21000"))
-    fallback_gas_price_gwei: int = int(os.getenv("DEFAULT_GAS_PRICE_GWEI", "20"))
 
     max_priority_fee_gwei: int = int(os.getenv("MAX_PRIORITY_FEE_GWEI", "3"))
     max_fee_multiplier: int = int(os.getenv("MAX_FEE_MULTIPLIER", "2"))
+    replacement_fee_bump_percent: int = int(os.getenv("REPLACEMENT_FEE_BUMP_PERCENT", "12"))
 
     max_workers: int = int(os.getenv("MAX_WORKERS", "5"))
     max_send_retries: int = int(os.getenv("MAX_SEND_RETRIES", "3"))
 
-    receipt_retry_delay: float = float(os.getenv("RECEIPT_RETRY_DELAY", "2"))
-    max_receipt_retries: int = int(os.getenv("MAX_RECEIPT_RETRIES", "6"))
+    receipt_poll_interval: float = float(os.getenv("RECEIPT_POLL_INTERVAL", "2"))
+    max_receipt_wait_seconds: int = int(os.getenv("MAX_RECEIPT_WAIT_SECONDS", "120"))
 
     wallets_file: str = os.getenv("WALLETS_FILE", "wallets.json")
     failed_tx_file: str = os.getenv("FAILED_TX_FILE", "failed_transactions.json")
@@ -73,31 +66,10 @@ STOP_EVENT = Event()
 # Logging
 # =============================================================================
 
-def setup_logging() -> None:
-    try:
-        import colorlog
-        handler = colorlog.StreamHandler()
-        handler.setFormatter(
-            colorlog.ColoredFormatter(
-                "%(log_color)s%(asctime)s [%(levelname)s]%(reset)s %(message)s",
-                log_colors={
-                    "DEBUG": "cyan",
-                    "INFO": "green",
-                    "WARNING": "yellow",
-                    "ERROR": "red",
-                    "CRITICAL": "bold_red",
-                },
-            )
-        )
-        logging.basicConfig(level=logging.INFO, handlers=[handler])
-    except ImportError:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(message)s",
-        )
-
-
-setup_logging()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
 
 # =============================================================================
@@ -110,18 +82,19 @@ _web3_lock = Lock()
 
 def get_web3() -> Web3:
     global _web3
+
     with _web3_lock:
         if _web3:
             return _web3
 
         if not CONFIG.infura_project_id:
-            raise RuntimeError("INFURA_PROJECT_ID is not set")
+            raise RuntimeError("INFURA_PROJECT_ID not set")
 
         url = f"https://{CONFIG.network}.infura.io/v3/{CONFIG.infura_project_id}"
-        w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 20}))
+        w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30}))
 
         if not w3.is_connected():
-            raise ConnectionError("Failed to connect to Infura")
+            raise ConnectionError("Failed to connect to RPC")
 
         logging.info(f"Connected to {CONFIG.network} (chain_id={CONFIG.chain_id})")
         _web3 = w3
@@ -133,7 +106,7 @@ def get_web3() -> Web3:
 # =============================================================================
 
 def backoff(base: float, attempt: int) -> float:
-    return base * (2 ** (attempt - 1)) + random.uniform(0.1, 0.6)
+    return base * (2 ** (attempt - 1)) + random.uniform(0.1, 0.5)
 
 
 def atomic_write(path: Path, data: str) -> None:
@@ -150,17 +123,25 @@ class TxError(Enum):
     RETRYABLE = "retryable"
     NONCE = "nonce"
     INSUFFICIENT_FUNDS = "insufficient_funds"
+    REPLACEMENT_UNDERPRICED = "replacement_underpriced"
     FATAL = "fatal"
 
 
 def classify_error(exc: Exception) -> TxError:
     msg = str(exc).lower()
-    if "nonce too low" in msg or "replacement transaction underpriced" in msg:
+
+    if "nonce too low" in msg:
         return TxError.NONCE
+
+    if "replacement transaction underpriced" in msg:
+        return TxError.REPLACEMENT_UNDERPRICED
+
     if "insufficient funds" in msg:
         return TxError.INSUFFICIENT_FUNDS
+
     if "timeout" in msg or "connection" in msg:
         return TxError.RETRYABLE
+
     return TxError.FATAL
 
 
@@ -176,13 +157,13 @@ class NonceManager:
     def reserve(self, address: str) -> int:
         w3 = get_web3()
         with self._lock:
-            if address not in self._nonces:
-                self._nonces[address] = w3.eth.get_transaction_count(address, "pending")
-            nonce = self._nonces[address]
-            self._nonces[address] += 1
+            chain_nonce = w3.eth.get_transaction_count(address, "pending")
+            local_nonce = self._nonces.get(address, chain_nonce)
+            nonce = max(chain_nonce, local_nonce)
+            self._nonces[address] = nonce + 1
             return nonce
 
-    def reset(self, address: str) -> None:
+    def sync(self, address: str) -> None:
         w3 = get_web3()
         with self._lock:
             self._nonces[address] = w3.eth.get_transaction_count(address, "pending")
@@ -192,37 +173,33 @@ NONCES = NonceManager()
 
 
 # =============================================================================
-# Receipt Handling
+# Fee Logic
 # =============================================================================
 
-def wait_for_receipt(tx_hash: bytes) -> Optional[Dict[str, Any]]:
+def build_eip1559_fees(multiplier: int = 1) -> Dict[str, int]:
     w3 = get_web3()
-    hex_hash = tx_hash.hex()
+    block = w3.eth.get_block("latest")
 
-    for attempt in range(1, CONFIG.max_receipt_retries + 1):
-        if STOP_EVENT.is_set():
-            return None
-        try:
-            receipt = w3.eth.get_transaction_receipt(tx_hash)
-            if receipt:
-                logging.info(f"Confirmed {hex_hash} in block {receipt.blockNumber}")
-                return receipt
-        except TransactionNotFound:
-            pass
-        except Exception as exc:
-            logging.warning(f"Receipt error {hex_hash}: {exc}")
+    if "baseFeePerGas" not in block:
+        raise RuntimeError("Chain does not support EIP-1559")
 
-        time.sleep(backoff(CONFIG.receipt_retry_delay, attempt))
+    base_fee = block["baseFeePerGas"]
+    priority = w3.to_wei(CONFIG.max_priority_fee_gwei, "gwei")
 
-    logging.error(f"Receipt timeout: {hex_hash}")
-    return None
+    max_fee = base_fee * CONFIG.max_fee_multiplier * multiplier + priority
+
+    return {
+        "type": 2,
+        "maxPriorityFeePerGas": int(priority),
+        "maxFeePerGas": int(max_fee),
+    }
 
 
 # =============================================================================
-# Transaction Building
+# Transaction
 # =============================================================================
 
-def build_tx(wallet: Dict[str, Any]) -> Dict[str, Any]:
+def build_tx(wallet: Dict[str, Any], fee_multiplier: int = 1) -> Dict[str, Any]:
     w3 = get_web3()
 
     tx: Dict[str, Any] = {
@@ -232,20 +209,7 @@ def build_tx(wallet: Dict[str, Any]) -> Dict[str, Any]:
         "chainId": CONFIG.chain_id,
     }
 
-    # EIP-1559 preferred
-    try:
-        block = w3.eth.get_block("latest")
-        base_fee = block["baseFeePerGas"]
-        priority = w3.to_wei(CONFIG.max_priority_fee_gwei, "gwei")
-
-        max_fee = base_fee * CONFIG.max_fee_multiplier + priority
-        tx.update({
-            "type": 2,
-            "maxPriorityFeePerGas": priority,
-            "maxFeePerGas": max_fee,
-        })
-    except Exception:
-        tx["gasPrice"] = w3.to_wei(CONFIG.fallback_gas_price_gwei, "gwei")
+    tx.update(build_eip1559_fees(multiplier=fee_multiplier))
 
     try:
         tx["gas"] = w3.eth.estimate_gas(tx)
@@ -255,19 +219,38 @@ def build_tx(wallet: Dict[str, Any]) -> Dict[str, Any]:
     return tx
 
 
-# =============================================================================
-# Transaction Sending
-# =============================================================================
+def wait_for_receipt(tx_hash: bytes) -> Optional[Dict[str, Any]]:
+    w3 = get_web3()
+    start = time.time()
+
+    while not STOP_EVENT.is_set():
+        if time.time() - start > CONFIG.max_receipt_wait_seconds:
+            return None
+
+        try:
+            receipt = w3.eth.get_transaction_receipt(tx_hash)
+            if receipt:
+                return receipt
+        except TransactionNotFound:
+            pass
+
+        time.sleep(CONFIG.receipt_poll_interval)
+
+    return None
+
 
 def send_eth(wallet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     w3 = get_web3()
     addr = wallet["from_address"]
+    fee_multiplier = 1
 
     for attempt in range(1, CONFIG.max_send_retries + 1):
+
         if STOP_EVENT.is_set():
             return None
+
         try:
-            tx = build_tx(wallet)
+            tx = build_tx(wallet, fee_multiplier)
             signed = w3.eth.account.sign_transaction(tx, wallet["private_key"])
             tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
 
@@ -281,22 +264,26 @@ def send_eth(wallet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         except Exception as exc:
             category = classify_error(exc)
 
-            if category is TxError.INSUFFICIENT_FUNDS:
+            if category == TxError.INSUFFICIENT_FUNDS:
                 logging.error(f"Insufficient funds: {addr}")
                 return None
 
-            if category is TxError.NONCE:
-                logging.warning(f"Nonce conflict, resetting nonce ({addr})")
-                NONCES.reset(addr)
+            if category == TxError.NONCE:
+                logging.warning(f"Nonce mismatch → resyncing {addr}")
+                NONCES.sync(addr)
+                continue
 
-            if category is TxError.FATAL:
-                logging.error(f"Fatal tx error ({addr}): {exc}")
+            if category == TxError.REPLACEMENT_UNDERPRICED:
+                fee_multiplier *= 1 + CONFIG.replacement_fee_bump_percent / 100
+                logging.warning(f"Bumping fee multiplier → {fee_multiplier:.2f}")
+                continue
+
+            if category == TxError.FATAL:
+                logging.error(f"Fatal error ({addr}): {exc}")
                 return None
 
-            logging.warning(
-                f"Retryable error ({addr}, attempt {attempt}): {exc}"
-            )
-            time.sleep(backoff(1.0, attempt))
+            logging.warning(f"Retryable error ({addr}): {exc}")
+            time.sleep(backoff(1, attempt))
 
     return None
 
@@ -314,26 +301,22 @@ def load_wallets(path: str) -> List[Dict[str, Any]]:
         logging.error(f"Wallet file not found: {file}")
         return []
 
-    wallets: List[Dict[str, Any]] = []
     w3 = get_web3()
+    wallets: List[Dict[str, Any]] = []
 
     try:
         raw = json.loads(file.read_text("utf-8"))
-        if not isinstance(raw, list):
-            raise ValueError("Wallet file must contain a list")
 
         for w in raw:
-            if not isinstance(w, dict) or not REQUIRED_FIELDS.issubset(w):
+            if not REQUIRED_FIELDS.issubset(w):
                 continue
-            try:
-                wallets.append({
-                    "from_address": w3.to_checksum_address(w["from_address"]),
-                    "to_address": w3.to_checksum_address(w["to_address"]),
-                    "private_key": w["private_key"],
-                    "value": float(w["value"]),
-                })
-            except Exception:
-                logging.warning(f"Invalid wallet skipped: {w}")
+
+            wallets.append({
+                "from_address": w3.to_checksum_address(w["from_address"]),
+                "to_address": w3.to_checksum_address(w["to_address"]),
+                "private_key": w["private_key"],
+                "value": Decimal(str(w["value"])),
+            })
 
     except Exception as exc:
         logging.error(f"Wallet parse error: {exc}")
@@ -345,39 +328,25 @@ def load_wallets(path: str) -> List[Dict[str, Any]]:
 def save_failed(wallets: List[Dict[str, Any]]) -> None:
     if not wallets:
         return
-    try:
-        atomic_write(
-            Path(CONFIG.failed_tx_file),
-            json.dumps(wallets, indent=2),
-        )
-        logging.info(f"Saved {len(wallets)} failed transaction(s)")
-    except Exception as exc:
-        logging.error(f"Failed to persist failed txs: {exc}")
+
+    atomic_write(
+        Path(CONFIG.failed_tx_file),
+        json.dumps(wallets, indent=2, default=str),
+    )
+
+    logging.info(f"Saved {len(wallets)} failed transaction(s)")
 
 
 # =============================================================================
 # Execution
 # =============================================================================
 
-def process_wallet(wallet: Dict[str, Any]) -> bool:
-    start = time.perf_counter()
-    receipt = send_eth(wallet)
-    elapsed = time.perf_counter() - start
-
-    if receipt:
-        logging.info(f"Completed in {elapsed:.2f}s | {wallet['from_address'][:8]}")
-        return True
-
-    logging.warning(f"Failed: {wallet['from_address'][:8]}")
-    return False
-
-
 def run(wallets: List[Dict[str, Any]]) -> None:
     failed: List[Dict[str, Any]] = []
     success = 0
 
     with concurrent.futures.ThreadPoolExecutor(CONFIG.max_workers) as executor:
-        futures = {executor.submit(process_wallet, w): w for w in wallets}
+        futures = {executor.submit(send_eth, w): w for w in wallets}
 
         for fut in concurrent.futures.as_completed(futures):
             wallet = futures[fut]
@@ -391,24 +360,24 @@ def run(wallets: List[Dict[str, Any]]) -> None:
                 failed.append(wallet)
 
     save_failed(failed)
-    logging.info(f"Summary: {success} success, {len(failed)} failed")
+    logging.info(f"Summary: {success} success | {len(failed)} failed")
 
 
 # =============================================================================
 # Entrypoint
 # =============================================================================
 
-def main() -> None:
-    wallets = load_wallets(CONFIG.wallets_file)
-    if not wallets:
-        logging.error("No valid wallets loaded")
-        return
-    run(wallets)
-
-
 def _graceful_exit(*_: object) -> None:
     logging.warning("Shutdown signal received")
     STOP_EVENT.set()
+
+
+def main() -> None:
+    wallets = load_wallets(CONFIG.wallets_file)
+    if wallets:
+        run(wallets)
+    else:
+        logging.error("No valid wallets loaded")
 
 
 if __name__ == "__main__":
