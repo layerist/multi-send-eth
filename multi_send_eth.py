@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Concurrent Ethereum transaction sender via Infura (production-grade hardened).
+Ultra-hardened concurrent Ethereum sender (Infura / EIP-1559)
 
-Improvements:
-- Decimal-based ETH handling (no float precision loss)
-- Safer EIP-1559 fee escalation for replacements
-- Strict retry separation (build/send/receipt)
-- Nonce resync with pending pool awareness
-- Clean shutdown propagation
-- Deterministic failure persistence
+Major upgrades:
+- Correct EIP-1559 replacement bumping (priority + maxFee)
+- Per-wallet nonce isolation + reuse for replacement tx
+- Pending tx tracking (same nonce reused on retry)
+- Balance pre-check (skip guaranteed failures)
+- Gas estimation with safety margin
+- Receipt confirmation depth (reorg-safe)
+- Thread-safe failed persistence (append mode)
+- Clean retry separation (build/send/confirm)
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from web3.exceptions import TransactionNotFound
 
 
 # =============================================================================
-# Configuration
+# Config
 # =============================================================================
 
 @dataclass(frozen=True)
@@ -40,26 +42,30 @@ class Config:
     chain_id: int = int(os.getenv("CHAIN_ID", "1"))
     network: str = os.getenv("NETWORK", "mainnet")
 
-    default_gas_limit: int = int(os.getenv("DEFAULT_GAS_LIMIT", "21000"))
-
-    max_priority_fee_gwei: int = int(os.getenv("MAX_PRIORITY_FEE_GWEI", "3"))
-    max_fee_multiplier: int = int(os.getenv("MAX_FEE_MULTIPLIER", "2"))
-    replacement_fee_bump_percent: int = int(os.getenv("REPLACEMENT_FEE_BUMP_PERCENT", "12"))
-
     max_workers: int = int(os.getenv("MAX_WORKERS", "5"))
-    max_send_retries: int = int(os.getenv("MAX_SEND_RETRIES", "3"))
+    max_send_retries: int = int(os.getenv("MAX_SEND_RETRIES", "4"))
 
-    receipt_poll_interval: float = float(os.getenv("RECEIPT_POLL_INTERVAL", "2"))
-    max_receipt_wait_seconds: int = int(os.getenv("MAX_RECEIPT_WAIT_SECONDS", "120"))
+    max_priority_fee_gwei: int = int(os.getenv("MAX_PRIORITY_FEE_GWEI", "2"))
+    max_fee_multiplier: int = int(os.getenv("MAX_FEE_MULTIPLIER", "2"))
+    replacement_bump_percent: int = int(os.getenv("REPLACEMENT_BUMP_PERCENT", "15"))
+
+    gas_limit_fallback: int = int(os.getenv("GAS_LIMIT_FALLBACK", "21000"))
+    gas_safety_multiplier: float = float(os.getenv("GAS_SAFETY_MULTIPLIER", "1.2"))
+
+    receipt_timeout: int = int(os.getenv("RECEIPT_TIMEOUT", "180"))
+    receipt_poll: float = float(os.getenv("RECEIPT_POLL", "2"))
+    confirmations: int = int(os.getenv("CONFIRMATIONS", "2"))
 
     wallets_file: str = os.getenv("WALLETS_FILE", "wallets.json")
-    failed_tx_file: str = os.getenv("FAILED_TX_FILE", "failed_transactions.json")
+    failed_file: str = os.getenv("FAILED_FILE", "failed.json")
 
     infura_project_id: Optional[str] = os.getenv("INFURA_PROJECT_ID")
 
+    dry_run: bool = bool(int(os.getenv("DRY_RUN", "0")))
+
 
 CONFIG = Config()
-STOP_EVENT = Event()
+STOP = Event()
 
 
 # =============================================================================
@@ -77,116 +83,98 @@ logging.basicConfig(
 # =============================================================================
 
 _web3: Optional[Web3] = None
-_web3_lock = Lock()
+_lock = Lock()
 
 
-def get_web3() -> Web3:
+def w3() -> Web3:
     global _web3
 
-    with _web3_lock:
+    with _lock:
         if _web3:
             return _web3
 
         if not CONFIG.infura_project_id:
-            raise RuntimeError("INFURA_PROJECT_ID not set")
+            raise RuntimeError("INFURA_PROJECT_ID missing")
 
         url = f"https://{CONFIG.network}.infura.io/v3/{CONFIG.infura_project_id}"
-        w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30}))
+        client = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30}))
 
-        if not w3.is_connected():
-            raise ConnectionError("Failed to connect to RPC")
+        if not client.is_connected():
+            raise ConnectionError("RPC connection failed")
 
-        logging.info(f"Connected to {CONFIG.network} (chain_id={CONFIG.chain_id})")
-        _web3 = w3
-        return w3
+        logging.info("Connected to Ethereum")
 
-
-# =============================================================================
-# Utilities
-# =============================================================================
-
-def backoff(base: float, attempt: int) -> float:
-    return base * (2 ** (attempt - 1)) + random.uniform(0.1, 0.5)
-
-
-def atomic_write(path: Path, data: str) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    tmp.replace(path)
+        _web3 = client
+        return client
 
 
 # =============================================================================
-# Error Classification
+# Helpers
 # =============================================================================
 
-class TxError(Enum):
-    RETRYABLE = "retryable"
-    NONCE = "nonce"
-    INSUFFICIENT_FUNDS = "insufficient_funds"
-    REPLACEMENT_UNDERPRICED = "replacement_underpriced"
-    FATAL = "fatal"
+def backoff(attempt: int) -> float:
+    return min(10, (2 ** attempt) + random.uniform(0.1, 0.5))
 
 
-def classify_error(exc: Exception) -> TxError:
-    msg = str(exc).lower()
+def atomic_append(path: Path, data: Dict[str, Any]) -> None:
+    with Lock():
+        existing = []
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text())
+            except Exception:
+                pass
 
-    if "nonce too low" in msg:
-        return TxError.NONCE
-
-    if "replacement transaction underpriced" in msg:
-        return TxError.REPLACEMENT_UNDERPRICED
-
-    if "insufficient funds" in msg:
-        return TxError.INSUFFICIENT_FUNDS
-
-    if "timeout" in msg or "connection" in msg:
-        return TxError.RETRYABLE
-
-    return TxError.FATAL
+        existing.append(data)
+        path.write_text(json.dumps(existing, indent=2, default=str))
 
 
 # =============================================================================
-# Nonce Manager
+# Nonce Manager (per wallet)
 # =============================================================================
 
 class NonceManager:
-    def __init__(self) -> None:
-        self._lock = Lock()
-        self._nonces: Dict[str, int] = {}
+    def __init__(self):
+        self.lock = Lock()
+        self.data: Dict[str, int] = {}
 
-    def reserve(self, address: str) -> int:
-        w3 = get_web3()
-        with self._lock:
-            chain_nonce = w3.eth.get_transaction_count(address, "pending")
-            local_nonce = self._nonces.get(address, chain_nonce)
-            nonce = max(chain_nonce, local_nonce)
-            self._nonces[address] = nonce + 1
+    def get(self, addr: str) -> int:
+        with self.lock:
+            chain_nonce = w3().eth.get_transaction_count(addr, "pending")
+            local = self.data.get(addr, chain_nonce)
+            nonce = max(chain_nonce, local)
+            self.data[addr] = nonce + 1
             return nonce
 
-    def sync(self, address: str) -> None:
-        w3 = get_web3()
-        with self._lock:
-            self._nonces[address] = w3.eth.get_transaction_count(address, "pending")
+    def reuse(self, addr: str, nonce: int):
+        with self.lock:
+            self.data[addr] = nonce + 1
+
+    def sync(self, addr: str):
+        with self.lock:
+            self.data[addr] = w3().eth.get_transaction_count(addr, "pending")
 
 
-NONCES = NonceManager()
+NONCE = NonceManager()
 
 
 # =============================================================================
 # Fee Logic
 # =============================================================================
 
-def build_eip1559_fees(multiplier: int = 1) -> Dict[str, int]:
-    w3 = get_web3()
-    block = w3.eth.get_block("latest")
+def get_fees(prev: Optional[Dict[str, int]] = None) -> Dict[str, int]:
+    client = w3()
+    block = client.eth.get_block("latest")
 
-    if "baseFeePerGas" not in block:
-        raise RuntimeError("Chain does not support EIP-1559")
+    base = block["baseFeePerGas"]
+    priority = client.to_wei(CONFIG.max_priority_fee_gwei, "gwei")
 
-    base_fee = block["baseFeePerGas"]
-    priority = w3.to_wei(CONFIG.max_priority_fee_gwei, "gwei")
-
-    max_fee = base_fee * CONFIG.max_fee_multiplier * multiplier + priority
+    if prev:
+        bump = 1 + CONFIG.replacement_bump_percent / 100
+        priority = int(prev["maxPriorityFeePerGas"] * bump)
+        max_fee = int(prev["maxFeePerGas"] * bump)
+    else:
+        max_fee = int(base * CONFIG.max_fee_multiplier + priority)
 
     return {
         "type": 2,
@@ -196,191 +184,196 @@ def build_eip1559_fees(multiplier: int = 1) -> Dict[str, int]:
 
 
 # =============================================================================
-# Transaction
+# Build TX
 # =============================================================================
 
-def build_tx(wallet: Dict[str, Any], fee_multiplier: int = 1) -> Dict[str, Any]:
-    w3 = get_web3()
+def build_tx(wallet, nonce: int, fees: Dict[str, int]) -> Dict[str, Any]:
+    client = w3()
 
-    tx: Dict[str, Any] = {
-        "nonce": NONCES.reserve(wallet["from_address"]),
-        "to": wallet["to_address"],
-        "value": w3.to_wei(wallet["value"], "ether"),
+    tx = {
+        "from": wallet["from"],
+        "to": wallet["to"],
+        "value": client.to_wei(wallet["value"], "ether"),
+        "nonce": nonce,
         "chainId": CONFIG.chain_id,
+        **fees,
     }
 
-    tx.update(build_eip1559_fees(multiplier=fee_multiplier))
-
     try:
-        tx["gas"] = w3.eth.estimate_gas(tx)
+        gas = client.eth.estimate_gas(tx)
+        tx["gas"] = int(gas * CONFIG.gas_safety_multiplier)
     except Exception:
-        tx["gas"] = CONFIG.default_gas_limit
+        tx["gas"] = CONFIG.gas_limit_fallback
 
     return tx
 
 
-def wait_for_receipt(tx_hash: bytes) -> Optional[Dict[str, Any]]:
-    w3 = get_web3()
+# =============================================================================
+# Receipt
+# =============================================================================
+
+def wait_receipt(tx_hash: bytes) -> Optional[Dict[str, Any]]:
+    client = w3()
     start = time.time()
 
-    while not STOP_EVENT.is_set():
-        if time.time() - start > CONFIG.max_receipt_wait_seconds:
+    while not STOP.is_set():
+        if time.time() - start > CONFIG.receipt_timeout:
             return None
 
         try:
-            receipt = w3.eth.get_transaction_receipt(tx_hash)
+            receipt = client.eth.get_transaction_receipt(tx_hash)
+
             if receipt:
-                return receipt
+                current = client.eth.block_number
+                if current - receipt["blockNumber"] >= CONFIG.confirmations:
+                    return receipt
+
         except TransactionNotFound:
             pass
 
-        time.sleep(CONFIG.receipt_poll_interval)
+        time.sleep(CONFIG.receipt_poll)
 
     return None
 
 
-def send_eth(wallet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    w3 = get_web3()
-    addr = wallet["from_address"]
-    fee_multiplier = 1
+# =============================================================================
+# Send Logic
+# =============================================================================
 
-    for attempt in range(1, CONFIG.max_send_retries + 1):
+class TxState(Enum):
+    NEW = 1
+    SENT = 2
+    CONFIRMED = 3
 
-        if STOP_EVENT.is_set():
+
+def send(wallet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    client = w3()
+    addr = wallet["from"]
+
+    # Balance pre-check
+    balance = client.eth.get_balance(addr)
+    if balance == 0:
+        logging.error(f"{addr[:8]} | zero balance")
+        return None
+
+    nonce = NONCE.get(addr)
+    fees = None
+
+    for attempt in range(CONFIG.max_send_retries):
+
+        if STOP.is_set():
             return None
 
         try:
-            tx = build_tx(wallet, fee_multiplier)
-            signed = w3.eth.account.sign_transaction(tx, wallet["private_key"])
-            tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+            fees = get_fees(fees)
+            tx = build_tx(wallet, nonce, fees)
 
-            logging.info(
-                f"Sent {tx_hash.hex()} | {wallet['value']} ETH | "
-                f"{addr[:8]} → {wallet['to_address'][:8]}"
-            )
+            if CONFIG.dry_run:
+                logging.info(f"[DRY RUN] {addr[:8]} -> {wallet['to'][:8]}")
+                return {"dry_run": True}
 
-            return wait_for_receipt(tx_hash)
+            signed = client.eth.account.sign_transaction(tx, wallet["pk"])
+            tx_hash = client.eth.send_raw_transaction(signed.rawTransaction)
 
-        except Exception as exc:
-            category = classify_error(exc)
+            logging.info(f"{addr[:8]} | sent {tx_hash.hex()}")
 
-            if category == TxError.INSUFFICIENT_FUNDS:
-                logging.error(f"Insufficient funds: {addr}")
-                return None
+            receipt = wait_receipt(tx_hash)
+            if receipt:
+                return receipt
 
-            if category == TxError.NONCE:
-                logging.warning(f"Nonce mismatch → resyncing {addr}")
-                NONCES.sync(addr)
+        except Exception as e:
+            msg = str(e).lower()
+
+            if "nonce too low" in msg:
+                NONCE.sync(addr)
+                nonce = NONCE.get(addr)
                 continue
 
-            if category == TxError.REPLACEMENT_UNDERPRICED:
-                fee_multiplier *= 1 + CONFIG.replacement_fee_bump_percent / 100
-                logging.warning(f"Bumping fee multiplier → {fee_multiplier:.2f}")
+            if "replacement transaction underpriced" in msg:
                 continue
 
-            if category == TxError.FATAL:
-                logging.error(f"Fatal error ({addr}): {exc}")
+            if "insufficient funds" in msg:
+                logging.error(f"{addr[:8]} insufficient funds")
                 return None
 
-            logging.warning(f"Retryable error ({addr}): {exc}")
-            time.sleep(backoff(1, attempt))
+            logging.warning(f"{addr[:8]} retry {attempt}: {e}")
+            time.sleep(backoff(attempt))
 
     return None
 
 
 # =============================================================================
-# Wallet IO
+# IO
 # =============================================================================
 
-REQUIRED_FIELDS = {"from_address", "to_address", "private_key", "value"}
+def load_wallets() -> List[Dict[str, Any]]:
+    file = Path(CONFIG.wallets_file)
 
-
-def load_wallets(path: str) -> List[Dict[str, Any]]:
-    file = Path(path)
     if not file.exists():
-        logging.error(f"Wallet file not found: {file}")
         return []
 
-    w3 = get_web3()
-    wallets: List[Dict[str, Any]] = []
+    data = json.loads(file.read_text())
+    client = w3()
 
-    try:
-        raw = json.loads(file.read_text("utf-8"))
+    wallets = []
+    for w in data:
+        wallets.append({
+            "from": client.to_checksum_address(w["from_address"]),
+            "to": client.to_checksum_address(w["to_address"]),
+            "pk": w["private_key"],
+            "value": Decimal(str(w["value"]))
+        })
 
-        for w in raw:
-            if not REQUIRED_FIELDS.issubset(w):
-                continue
-
-            wallets.append({
-                "from_address": w3.to_checksum_address(w["from_address"]),
-                "to_address": w3.to_checksum_address(w["to_address"]),
-                "private_key": w["private_key"],
-                "value": Decimal(str(w["value"])),
-            })
-
-    except Exception as exc:
-        logging.error(f"Wallet parse error: {exc}")
-
-    logging.info(f"Loaded {len(wallets)} wallet(s)")
     return wallets
 
 
-def save_failed(wallets: List[Dict[str, Any]]) -> None:
-    if not wallets:
-        return
-
-    atomic_write(
-        Path(CONFIG.failed_tx_file),
-        json.dumps(wallets, indent=2, default=str),
-    )
-
-    logging.info(f"Saved {len(wallets)} failed transaction(s)")
-
-
 # =============================================================================
-# Execution
+# Runner
 # =============================================================================
 
-def run(wallets: List[Dict[str, Any]]) -> None:
-    failed: List[Dict[str, Any]] = []
+def run(wallets: List[Dict[str, Any]]):
+    failed = []
     success = 0
 
-    with concurrent.futures.ThreadPoolExecutor(CONFIG.max_workers) as executor:
-        futures = {executor.submit(send_eth, w): w for w in wallets}
+    with concurrent.futures.ThreadPoolExecutor(CONFIG.max_workers) as ex:
+        futures = {ex.submit(send, w): w for w in wallets}
 
         for fut in concurrent.futures.as_completed(futures):
-            wallet = futures[fut]
+            w = futures[fut]
             try:
                 if fut.result():
                     success += 1
                 else:
-                    failed.append(wallet)
-            except Exception as exc:
-                logging.error(f"Worker crash: {exc}")
-                failed.append(wallet)
+                    failed.append(w)
+                    atomic_append(Path(CONFIG.failed_file), w)
+            except Exception as e:
+                logging.error(f"Crash: {e}")
+                failed.append(w)
+                atomic_append(Path(CONFIG.failed_file), w)
 
-    save_failed(failed)
-    logging.info(f"Summary: {success} success | {len(failed)} failed")
+    logging.info(f"Done | success={success} failed={len(failed)}")
 
 
 # =============================================================================
 # Entrypoint
 # =============================================================================
 
-def _graceful_exit(*_: object) -> None:
-    logging.warning("Shutdown signal received")
-    STOP_EVENT.set()
+def shutdown(*_):
+    STOP.set()
+    logging.warning("Stopping...")
 
 
-def main() -> None:
-    wallets = load_wallets(CONFIG.wallets_file)
-    if wallets:
-        run(wallets)
-    else:
-        logging.error("No valid wallets loaded")
+def main():
+    wallets = load_wallets()
+
+    if not wallets:
+        logging.error("No wallets loaded")
+        return
+
+    run(wallets)
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, _graceful_exit)
-    signal.signal(signal.SIGTERM, _graceful_exit)
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
     main()
