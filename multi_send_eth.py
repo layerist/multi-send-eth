@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""
-Ultra-hardened concurrent Ethereum sender (Infura / EIP-1559)
-
-Major upgrades:
-- Correct EIP-1559 replacement bumping (priority + maxFee)
-- Per-wallet nonce isolation + reuse for replacement tx
-- Pending tx tracking (same nonce reused on retry)
-- Balance pre-check (skip guaranteed failures)
-- Gas estimation with safety margin
-- Receipt confirmation depth (reorg-safe)
-- Thread-safe failed persistence (append mode)
-- Clean retry separation (build/send/confirm)
-"""
-
 from __future__ import annotations
 
 import concurrent.futures
@@ -24,7 +10,6 @@ import signal
 import time
 from dataclasses import dataclass
 from decimal import Decimal
-from enum import Enum
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Dict, List, Optional
@@ -43,11 +28,12 @@ class Config:
     network: str = os.getenv("NETWORK", "mainnet")
 
     max_workers: int = int(os.getenv("MAX_WORKERS", "5"))
-    max_send_retries: int = int(os.getenv("MAX_SEND_RETRIES", "4"))
+    max_send_retries: int = int(os.getenv("MAX_SEND_RETRIES", "5"))
 
     max_priority_fee_gwei: int = int(os.getenv("MAX_PRIORITY_FEE_GWEI", "2"))
-    max_fee_multiplier: int = int(os.getenv("MAX_FEE_MULTIPLIER", "2"))
+    max_fee_multiplier: float = float(os.getenv("MAX_FEE_MULTIPLIER", "2.0"))
     replacement_bump_percent: int = int(os.getenv("REPLACEMENT_BUMP_PERCENT", "15"))
+    min_bump_wei: int = int(os.getenv("MIN_BUMP_WEI", str(1_000_000_000)))  # 1 gwei
 
     gas_limit_fallback: int = int(os.getenv("GAS_LIMIT_FALLBACK", "21000"))
     gas_safety_multiplier: float = float(os.getenv("GAS_SAFETY_MULTIPLIER", "1.2"))
@@ -67,6 +53,8 @@ class Config:
 CONFIG = Config()
 STOP = Event()
 
+FAILED_LOCK = Lock()
+
 
 # =============================================================================
 # Logging
@@ -83,13 +71,13 @@ logging.basicConfig(
 # =============================================================================
 
 _web3: Optional[Web3] = None
-_lock = Lock()
+_w3_lock = Lock()
 
 
 def w3() -> Web3:
     global _web3
 
-    with _lock:
+    with _w3_lock:
         if _web3:
             return _web3
 
@@ -113,11 +101,11 @@ def w3() -> Web3:
 # =============================================================================
 
 def backoff(attempt: int) -> float:
-    return min(10, (2 ** attempt) + random.uniform(0.1, 0.5))
+    return min(15, (2 ** attempt) + random.uniform(0.2, 0.7))
 
 
 def atomic_append(path: Path, data: Dict[str, Any]) -> None:
-    with Lock():
+    with FAILED_LOCK:
         existing = []
         if path.exists():
             try:
@@ -130,7 +118,7 @@ def atomic_append(path: Path, data: Dict[str, Any]) -> None:
 
 
 # =============================================================================
-# Nonce Manager (per wallet)
+# Nonce Manager
 # =============================================================================
 
 class NonceManager:
@@ -140,15 +128,11 @@ class NonceManager:
 
     def get(self, addr: str) -> int:
         with self.lock:
-            chain_nonce = w3().eth.get_transaction_count(addr, "pending")
-            local = self.data.get(addr, chain_nonce)
-            nonce = max(chain_nonce, local)
+            chain = w3().eth.get_transaction_count(addr, "pending")
+            local = self.data.get(addr, chain)
+            nonce = max(chain, local)
             self.data[addr] = nonce + 1
             return nonce
-
-    def reuse(self, addr: str, nonce: int):
-        with self.lock:
-            self.data[addr] = nonce + 1
 
     def sync(self, addr: str):
         with self.lock:
@@ -167,19 +151,33 @@ def get_fees(prev: Optional[Dict[str, int]] = None) -> Dict[str, int]:
     block = client.eth.get_block("latest")
 
     base = block["baseFeePerGas"]
-    priority = client.to_wei(CONFIG.max_priority_fee_gwei, "gwei")
 
     if prev:
         bump = 1 + CONFIG.replacement_bump_percent / 100
-        priority = int(prev["maxPriorityFeePerGas"] * bump)
-        max_fee = int(prev["maxFeePerGas"] * bump)
-    else:
-        max_fee = int(base * CONFIG.max_fee_multiplier + priority)
+
+        new_priority = max(
+            int(prev["maxPriorityFeePerGas"] * bump),
+            prev["maxPriorityFeePerGas"] + CONFIG.min_bump_wei
+        )
+
+        new_max = max(
+            int(prev["maxFeePerGas"] * bump),
+            prev["maxFeePerGas"] + CONFIG.min_bump_wei
+        )
+
+        return {
+            "type": 2,
+            "maxPriorityFeePerGas": new_priority,
+            "maxFeePerGas": max(new_max, new_priority + base),
+        }
+
+    priority = client.to_wei(CONFIG.max_priority_fee_gwei, "gwei")
+    max_fee = int(base * CONFIG.max_fee_multiplier + priority)
 
     return {
         "type": 2,
-        "maxPriorityFeePerGas": int(priority),
-        "maxFeePerGas": int(max_fee),
+        "maxPriorityFeePerGas": priority,
+        "maxFeePerGas": max_fee,
     }
 
 
@@ -240,17 +238,10 @@ def wait_receipt(tx_hash: bytes) -> Optional[Dict[str, Any]]:
 # Send Logic
 # =============================================================================
 
-class TxState(Enum):
-    NEW = 1
-    SENT = 2
-    CONFIRMED = 3
-
-
 def send(wallet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     client = w3()
     addr = wallet["from"]
 
-    # Balance pre-check
     balance = client.eth.get_balance(addr)
     if balance == 0:
         logging.error(f"{addr[:8]} | zero balance")
@@ -258,6 +249,7 @@ def send(wallet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     nonce = NONCE.get(addr)
     fees = None
+    last_tx_hash = None
 
     for attempt in range(CONFIG.max_send_retries):
 
@@ -275,6 +267,7 @@ def send(wallet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             signed = client.eth.account.sign_transaction(tx, wallet["pk"])
             tx_hash = client.eth.send_raw_transaction(signed.rawTransaction)
 
+            last_tx_hash = tx_hash
             logging.info(f"{addr[:8]} | sent {tx_hash.hex()}")
 
             receipt = wait_receipt(tx_hash)
@@ -289,7 +282,14 @@ def send(wallet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 nonce = NONCE.get(addr)
                 continue
 
-            if "replacement transaction underpriced" in msg:
+            if "already known" in msg:
+                if last_tx_hash:
+                    receipt = wait_receipt(last_tx_hash)
+                    if receipt:
+                        return receipt
+                continue
+
+            if "underpriced" in msg:
                 continue
 
             if "insufficient funds" in msg:
