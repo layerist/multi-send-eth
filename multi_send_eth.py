@@ -134,7 +134,7 @@ def create_session() -> requests.Session:
             503,
             504,
         ],
-        allowed_methods=False,
+        allowed_methods=frozenset({"POST"}),
     )
 
     adapter = HTTPAdapter(
@@ -431,7 +431,7 @@ def wait_for_confirmations(
 
                 confirmations = (
                     current_block - receipt["blockNumber"]
-                )
+                ) + 1
 
                 if confirmations >= CONFIG.confirmations:
                     return receipt
@@ -479,7 +479,7 @@ def validate_wallet(wallet: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("Value must be positive")
 
     account = client.eth.account.from_key(
-        wallet["private_key"]
+        wallet["private_key"].strip()
     )
 
     if account.address.lower() != from_addr.lower():
@@ -583,6 +583,14 @@ def send(wallet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 receipt = wait_for_confirmations(tx_hash)
 
                 if receipt:
+                    if receipt.get("status") != 1:
+                        logger.error(
+                            f"{short(address)} | "
+                            f"transaction reverted | "
+                            f"block={receipt['blockNumber']}"
+                        )
+                        return None
+
                     logger.info(
                         f"{short(address)} | "
                         f"confirmed | "
@@ -673,6 +681,9 @@ def load_wallets() -> List[Dict[str, Any]]:
 
     with path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
+
+    if not isinstance(raw, list):
+        raise ValueError("wallets.json must contain a list")
 
     wallets = []
 
