@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Reliable EVM native-coin batch sender v2.
+Reliable EVM native-coin batch sender v3.
 
 Design goals:
 - one payment is never silently re-sent with a new nonce after broadcasting;
 - transactions from the same source address are serialized;
 - EIP-1559 and legacy fee support with explicit fee caps;
 - append-only JSONL journal (no O(n²) rewrites);
-- resumable runs using deterministic payment IDs;
+- crash-safe resumable runs using deterministic payment IDs and pre-broadcast journaling;
 - graceful shutdown and clear "pending/unknown" outcomes;
 - private keys are never written to logs or result files.
 
@@ -112,6 +112,7 @@ class Config:
     dry_run: bool = env_bool("DRY_RUN", False)
     resume: bool = env_bool("RESUME", True)
     fail_on_duplicate_payment: bool = env_bool("FAIL_ON_DUPLICATE_PAYMENT", True)
+    retry_unresolved: bool = env_bool("RETRY_UNRESOLVED", False)
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
     def validate(self) -> None:
@@ -365,11 +366,16 @@ def append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
             os.fsync(fh.fileno())
 
 
-def load_terminal_payment_ids(path: Path) -> set[str]:
-    """Only confirmed/dry-run records are skipped. Pending/failed items remain retryable."""
-    completed: set[str] = set()
+def load_resume_sets(path: Path) -> tuple[set[str], set[str]]:
+    """Return (completed, unresolved) payment IDs from the latest journal record.
+
+    Any payment that reached the signed/broadcast stage is conservatively blocked from
+    automatic resend until it has a terminal confirmed/dry-run/reverted record. This
+    prevents a restart from silently paying twice with a fresh nonce.
+    """
+    latest: dict[str, dict[str, Any]] = {}
     if not path.exists():
-        return completed
+        return set(), set()
 
     with path.open("r", encoding="utf-8") as fh:
         for line_no, line in enumerate(fh, start=1):
@@ -381,9 +387,58 @@ def load_terminal_payment_ids(path: Path) -> set[str]:
             except json.JSONDecodeError:
                 logger.warning("Ignoring invalid journal line %s", line_no)
                 continue
-            if item.get("state") in {"confirmed", "dry_run"} and item.get("payment_id"):
-                completed.add(str(item["payment_id"]))
-    return completed
+            payment_id = item.get("payment_id")
+            if payment_id:
+                latest[str(payment_id)] = item
+
+    completed: set[str] = set()
+    unresolved: set[str] = set()
+    unresolved_states = {"signed", "broadcast", "pending", "unknown"}
+    for payment_id, item in latest.items():
+        state = str(item.get("state", ""))
+        tx_hash = item.get("tx_hash") or item.get("expected_hash")
+        if state in {"confirmed", "dry_run"}:
+            completed.add(payment_id)
+        elif state in unresolved_states or (tx_hash and state not in {"reverted"}):
+            unresolved.add(payment_id)
+    return completed, unresolved
+
+
+def append_attempt_event(
+    config: Config,
+    payment: Payment,
+    *,
+    state: str,
+    nonce: int,
+    tx_hash: str,
+    fees: Mapping[str, int],
+    gas: int,
+    replacement_index: int,
+    detail: str,
+) -> None:
+    """Persist transaction identity before/after RPC broadcast.
+
+    The raw transaction and private key are intentionally never stored.
+    """
+    append_jsonl(
+        Path(config.journal_file),
+        {
+            "record_type": "attempt",
+            "payment_id": payment.payment_id,
+            "state": state,
+            "detail": detail,
+            "from_address": payment.from_address,
+            "to_address": payment.to_address,
+            "value_eth": str(payment.value_eth),
+            "value_wei": payment.value_wei,
+            "nonce": nonce,
+            "tx_hash": tx_hash,
+            "fees": dict(fees),
+            "gas": gas,
+            "replacement_index": replacement_index,
+            "timestamp": time.time(),
+        },
+    )
 
 
 def atomic_write_json(path: Path, data: Mapping[str, Any]) -> None:
@@ -746,8 +801,35 @@ def send_payment(payment: Payment, config: Config) -> Outcome:
                 raw = raw_transaction(signed)
                 expected_hash = normalize_tx_hash(Web3.keccak(raw))
 
+                # Persist the deterministic transaction identity *before* touching RPC.
+                # A process crash after RPC acceptance can therefore never erase the hash.
+                if expected_hash not in tx_hashes:
+                    tx_hashes.append(expected_hash)
+                append_attempt_event(
+                    config,
+                    payment,
+                    state="signed",
+                    nonce=nonce,
+                    tx_hash=expected_hash,
+                    fees=fees,
+                    gas=int(tx["gas"]),
+                    replacement_index=replacement_index,
+                    detail="signed_before_broadcast",
+                )
+
                 try:
                     tx_hash = broadcast_signed(client, raw, expected_hash, config)
+                    append_attempt_event(
+                        config,
+                        payment,
+                        state="broadcast",
+                        nonce=nonce,
+                        tx_hash=tx_hash,
+                        fees=fees,
+                        gas=int(tx["gas"]),
+                        replacement_index=replacement_index,
+                        detail="rpc_acknowledged_or_transaction_known",
+                    )
                 except Exception as exc:
                     message = str(exc).lower()
 
@@ -906,11 +988,27 @@ def send_payment(payment: Payment, config: Config) -> Outcome:
 
 def run(payments: list[Payment], config: Config) -> dict[str, Any]:
     journal_path = Path(config.journal_file)
+    skipped_completed = 0
+    skipped_unresolved = 0
     if config.resume:
-        completed_ids = load_terminal_payment_ids(journal_path)
+        completed_ids, unresolved_ids = load_resume_sets(journal_path)
         before = len(payments)
-        payments = [p for p in payments if p.payment_id not in completed_ids]
-        logger.info("Resume: skipped %s already completed payments", before - len(payments))
+        skipped_completed = sum(p.payment_id in completed_ids for p in payments)
+        skipped_unresolved = sum(p.payment_id in unresolved_ids for p in payments)
+        blocked = completed_ids | (set() if config.retry_unresolved else unresolved_ids)
+        payments = [p for p in payments if p.payment_id not in blocked]
+        logger.info(
+            "Resume: skipped completed=%s unresolved=%s retry_unresolved=%s",
+            skipped_completed,
+            0 if config.retry_unresolved else skipped_unresolved,
+            config.retry_unresolved,
+        )
+        if unresolved_ids and not config.retry_unresolved:
+            logger.warning(
+                "%s unresolved payment(s) were not resent automatically. "
+                "Inspect journal/chain; use --retry-unresolved only after verification.",
+                skipped_unresolved,
+            )
 
     total = len(payments)
     counters: dict[str, int] = {}
@@ -918,7 +1016,7 @@ def run(payments: list[Payment], config: Config) -> dict[str, Any]:
 
     if total == 0:
         logger.info("Nothing to send")
-        return {"total": 0, "duration_seconds": 0.0, "states": {}}
+        return {"total": 0, "duration_seconds": 0.0, "states": {}, "skipped_completed": skipped_completed, "skipped_unresolved": skipped_unresolved}
 
     logger.info(
         "Starting | payments=%s | workers=%s | dry_run=%s | journal=%s",
@@ -982,6 +1080,8 @@ def run(payments: list[Payment], config: Config) -> dict[str, Any]:
         "total": total,
         "duration_seconds": round(time.monotonic() - started, 3),
         "states": dict(sorted(counters.items())),
+        "skipped_completed": skipped_completed,
+        "skipped_unresolved": skipped_unresolved,
         "journal_file": str(journal_path),
         "stopped": STOP.is_set(),
         "timestamp": time.time(),
@@ -1004,7 +1104,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary", help="Run summary JSON file")
     parser.add_argument("--workers", type=int, help="Maximum worker count")
     parser.add_argument("--dry-run", action="store_true", help="Build and validate without broadcasting")
-    parser.add_argument("--no-resume", action="store_true", help="Do not skip confirmed journal entries")
+    parser.add_argument("--no-resume", action="store_true", help="Ignore journal resume protection")
+    parser.add_argument(
+        "--retry-unresolved",
+        action="store_true",
+        help="Allow resend of payments whose previous signed/broadcast attempt is unresolved (dangerous)",
+    )
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parser.parse_args()
 
@@ -1023,6 +1128,8 @@ def apply_args(config: Config, args: argparse.Namespace) -> Config:
         updates["dry_run"] = True
     if args.no_resume:
         updates["resume"] = False
+    if args.retry_unresolved:
+        updates["retry_unresolved"] = True
     if args.log_level:
         updates["log_level"] = args.log_level
     return replace(config, **updates)
@@ -1053,7 +1160,7 @@ def main() -> int:
             return 2
         summary = run(payments, config)
         # Pending/unknown/reverted/failed are intentionally non-zero.
-        bad = sum(summary["states"].get(state, 0) for state in ("failed", "reverted", "unknown", "pending"))
+        bad = sum(summary["states"].get(state, 0) for state in ("failed", "reverted", "unknown", "pending", "stopped"))
         return 1 if bad else 0
     except KeyboardInterrupt:
         STOP.set()
