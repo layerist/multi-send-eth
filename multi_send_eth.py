@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable EVM native-coin batch sender v3.
+Reliable EVM native-coin batch sender v4.
 
 Design goals:
 - one payment is never silently re-sent with a new nonce after broadcasting;
@@ -140,6 +140,17 @@ class Config:
             raise ValueError("receipt timeout/poll values must be positive")
         if self.confirmations <= 0:
             raise ValueError("CONFIRMATIONS must be positive")
+        if self.final_pending_wait < 0:
+            raise ValueError("FINAL_PENDING_WAIT cannot be negative")
+        if self.rpc_timeout <= 0 or self.rpc_retries < 0:
+            raise ValueError("RPC_TIMEOUT must be positive and RPC_RETRIES cannot be negative")
+        if self.session_pool_size <= 0:
+            raise ValueError("SESSION_POOL_SIZE must be positive")
+        if self.gas_limit_fallback < 21_000:
+            raise ValueError("GAS_LIMIT_FALLBACK must be at least 21000")
+        paths = [Path(self.wallets_file).resolve(), Path(self.journal_file).resolve(), Path(self.summary_file).resolve()]
+        if len(set(paths)) != len(paths):
+            raise ValueError("WALLETS_FILE, JOURNAL_FILE and SUMMARY_FILE must be different files")
 
 
 CONFIG = Config()
@@ -161,6 +172,8 @@ SUMMARY_LOCK = threading.Lock()
 THREAD_LOCAL = threading.local()
 ADDRESS_LOCKS: dict[str, threading.Lock] = {}
 ADDRESS_LOCKS_GUARD = threading.Lock()
+BLOCKED_SOURCES: set[str] = set()
+BLOCKED_SOURCES_GUARD = threading.Lock()
 
 
 # =============================================================================
@@ -176,6 +189,19 @@ class Payment:
     private_key: str = field(repr=False)
     value_eth: Decimal
     value_wei: int
+
+
+@dataclass(frozen=True)
+class ResumeInfo:
+    payment_id: str
+    last_state: str
+    nonce: Optional[int]
+    tx_hashes: tuple[str, ...]
+    last_fees: Optional[dict[str, int]]
+    last_replacement_index: int
+    from_address: Optional[str]
+    to_address: Optional[str]
+    value_wei: Optional[int]
 
 
 @dataclass(frozen=True)
@@ -257,6 +283,16 @@ def address_lock(address: str) -> threading.Lock:
             lock = threading.Lock()
             ADDRESS_LOCKS[key] = lock
         return lock
+
+
+def mark_source_blocked(address: str) -> None:
+    with BLOCKED_SOURCES_GUARD:
+        BLOCKED_SOURCES.add(address.lower())
+
+
+def source_is_blocked(address: str) -> bool:
+    with BLOCKED_SOURCES_GUARD:
+        return address.lower() in BLOCKED_SOURCES
 
 
 def payment_fingerprint(from_address: str, to_address: str, value_wei: int, external_id: str = "") -> str:
@@ -366,17 +402,16 @@ def append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
             os.fsync(fh.fileno())
 
 
-def load_resume_sets(path: Path) -> tuple[set[str], set[str]]:
-    """Return (completed, unresolved) payment IDs from the latest journal record.
+def load_resume_index(path: Path) -> dict[str, ResumeInfo]:
+    """Build conservative recovery metadata for the payment's latest nonce only.
 
-    Any payment that reached the signed/broadcast stage is conservatively blocked from
-    automatic resend until it has a terminal confirmed/dry-run/reverted record. This
-    prevents a restart from silently paying twice with a fresh nonce.
+    A payment may legitimately get a fresh nonce after a *reverted* transaction. Hashes
+    from that old nonce must never be mixed with a later unresolved attempt.
     """
-    latest: dict[str, dict[str, Any]] = {}
     if not path.exists():
-        return set(), set()
+        return {}
 
+    grouped: dict[str, dict[str, Any]] = {}
     with path.open("r", encoding="utf-8") as fh:
         for line_no, line in enumerate(fh, start=1):
             line = line.strip()
@@ -387,21 +422,82 @@ def load_resume_sets(path: Path) -> tuple[set[str], set[str]]:
             except json.JSONDecodeError:
                 logger.warning("Ignoring invalid journal line %s", line_no)
                 continue
-            payment_id = item.get("payment_id")
-            if payment_id:
-                latest[str(payment_id)] = item
 
-    completed: set[str] = set()
-    unresolved: set[str] = set()
-    unresolved_states = {"signed", "broadcast", "pending", "unknown"}
-    for payment_id, item in latest.items():
-        state = str(item.get("state", ""))
-        tx_hash = item.get("tx_hash") or item.get("expected_hash")
-        if state in {"confirmed", "dry_run"}:
-            completed.add(payment_id)
-        elif state in unresolved_states or (tx_hash and state not in {"reverted"}):
-            unresolved.add(payment_id)
-    return completed, unresolved
+            payment_id = item.get("payment_id")
+            if not payment_id:
+                continue
+            payment_id = str(payment_id)
+            bucket = grouped.setdefault(
+                payment_id,
+                {
+                    "last": None,
+                    "by_nonce": {},
+                    "from_address": None,
+                    "to_address": None,
+                    "value_wei": None,
+                },
+            )
+            bucket["last"] = item
+            nonce_value = item.get("nonce")
+            if nonce_value is not None:
+                nonce = int(nonce_value)
+                nonce_bucket = bucket["by_nonce"].setdefault(
+                    nonce,
+                    {"hashes": [], "last_fees": None, "last_replacement_index": -1},
+                )
+                tx_hash = item.get("tx_hash") or item.get("expected_hash")
+                if tx_hash and str(tx_hash) not in nonce_bucket["hashes"]:
+                    nonce_bucket["hashes"].append(str(tx_hash))
+                if isinstance(item.get("fees"), dict):
+                    nonce_bucket["last_fees"] = {
+                        str(k): int(v) for k, v in item["fees"].items()
+                    }
+                if item.get("replacement_index") is not None:
+                    nonce_bucket["last_replacement_index"] = max(
+                        int(nonce_bucket["last_replacement_index"]),
+                        int(item["replacement_index"]),
+                    )
+
+            for key in ("from_address", "to_address", "value_wei"):
+                if item.get(key) is not None:
+                    bucket[key] = item[key]
+
+    result: dict[str, ResumeInfo] = {}
+    for payment_id, bucket in grouped.items():
+        last = bucket["last"] or {}
+        nonce = int(last["nonce"]) if last.get("nonce") is not None else None
+        nonce_bucket = bucket["by_nonce"].get(nonce, {}) if nonce is not None else {}
+        result[payment_id] = ResumeInfo(
+            payment_id=payment_id,
+            last_state=str(last.get("state", "")),
+            nonce=nonce,
+            tx_hashes=tuple(nonce_bucket.get("hashes", [])),
+            last_fees=nonce_bucket.get("last_fees"),
+            last_replacement_index=int(nonce_bucket.get("last_replacement_index", -1)),
+            from_address=str(bucket["from_address"]) if bucket["from_address"] is not None else None,
+            to_address=str(bucket["to_address"]) if bucket["to_address"] is not None else None,
+            value_wei=int(bucket["value_wei"]) if bucket["value_wei"] is not None else None,
+        )
+    return result
+
+
+def payment_matches_resume(payment: Payment, info: ResumeInfo) -> bool:
+    """Protect an external payment ID from being accidentally reused for new payment data."""
+    return (
+        (info.from_address is None or info.from_address.lower() == payment.from_address.lower())
+        and (info.to_address is None or info.to_address.lower() == payment.to_address.lower())
+        and (info.value_wei is None or info.value_wei == payment.value_wei)
+    )
+
+
+def resume_class(info: ResumeInfo) -> str:
+    if info.last_state in {"confirmed", "dry_run"}:
+        return "completed"
+    if info.last_state == "reverted":
+        return "retryable"
+    if info.tx_hashes or info.last_state in {"signed", "broadcast", "pending", "unknown"}:
+        return "unresolved"
+    return "retryable"
 
 
 def append_attempt_event(
@@ -450,6 +546,15 @@ def atomic_write_json(path: Path, data: Mapping[str, Any]) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(temp, path)
+    # Best effort: persist the directory entry too on POSIX filesystems.
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except (AttributeError, OSError):
+        pass
 
 
 # =============================================================================
@@ -729,6 +834,13 @@ def broadcast_signed(
 
 
 def make_outcome(payment: Payment, started: float, **kwargs: Any) -> Outcome:
+    state = str(kwargs.get("state", ""))
+    tx_hash = kwargs.get("tx_hash")
+    tx_hashes = kwargs.get("tx_hashes") or ()
+    if state in {"pending", "unknown"} and (tx_hash or tx_hashes):
+        # Do not let later payments from the same source advance to higher nonces while
+        # the previous broadcast has an unresolved chain state.
+        mark_source_blocked(payment.from_address)
     return Outcome(
         payment_id=payment.payment_id,
         from_address=payment.from_address,
@@ -740,7 +852,25 @@ def make_outcome(payment: Payment, started: float, **kwargs: Any) -> Outcome:
     )
 
 
-def send_payment(payment: Payment, config: Config) -> Outcome:
+def find_known_receipt(
+    client: Web3, tx_hashes: Iterable[str], config: Config
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Check all known replacements immediately, newest first."""
+    for tx_hash in reversed(list(dict.fromkeys(tx_hashes))):
+        try:
+            receipt = get_receipt(client, tx_hash)
+            if receipt and receipt_confirmations(client, receipt) >= config.confirmations:
+                return tx_hash, receipt
+        except Exception as exc:
+            logger.warning("Recovery receipt check failed for %s: %s", tx_hash, exc)
+    return None, None
+
+
+def send_payment(
+    payment: Payment,
+    config: Config,
+    resume_info: Optional[ResumeInfo] = None,
+) -> Outcome:
     started = time.monotonic()
     client = web3(config)
 
@@ -748,236 +878,235 @@ def send_payment(payment: Payment, config: Config) -> Outcome:
     with address_lock(payment.from_address):
         if STOP.is_set():
             return make_outcome(payment, started, ok=False, state="stopped", reason="shutdown_requested")
+        if source_is_blocked(payment.from_address):
+            return make_outcome(
+                payment, started, ok=False, state="stopped",
+                reason="source_blocked_by_previous_unresolved_payment_in_this_run",
+            )
 
         nonce: Optional[int] = None
-        tx_hashes: list[str] = []
+        tx_hashes: list[str] = list(resume_info.tx_hashes) if resume_info else []
         try:
-            nonce = int(client.eth.get_transaction_count(payment.from_address, "pending"))
-            fees = initial_fees(client, config)
+            if resume_info and not payment_matches_resume(payment, resume_info):
+                return make_outcome(
+                    payment, started, ok=False, state="failed",
+                    reason="payment_id_reused_with_different_payment_data",
+                    nonce=resume_info.nonce, tx_hashes=tuple(tx_hashes),
+                )
 
-            for replacement_index in range(config.max_replacements + 1):
-                if STOP.is_set():
+            # Recovery is always same-nonce.  Never turn an unresolved payment into a
+            # second fresh-nonce payment after restart.
+            if resume_info and resume_class(resume_info) == "unresolved":
+                if resume_info.nonce is None:
                     return make_outcome(
-                        payment,
-                        started,
-                        ok=False,
-                        state="pending" if tx_hashes else "stopped",
-                        reason="shutdown_requested_after_broadcast" if tx_hashes else "shutdown_requested",
-                        nonce=nonce,
+                        payment, started, ok=False, state="unknown",
+                        reason="unresolved_journal_entry_without_nonce; manual_check_required",
                         tx_hash=tx_hashes[-1] if tx_hashes else None,
                         tx_hashes=tuple(tx_hashes),
                     )
+                nonce = resume_info.nonce
 
-                if replacement_index > 0:
+                found_hash, receipt = find_known_receipt(client, tx_hashes, config)
+                if receipt:
+                    status = int(receipt.get("status", 0))
+                    return make_outcome(
+                        payment, started, ok=status == 1,
+                        state="confirmed" if status == 1 else "reverted",
+                        reason="recovered_confirmed_receipt" if status == 1 else "recovered_reverted_receipt",
+                        nonce=nonce, tx_hash=found_hash, tx_hashes=tuple(tx_hashes), receipt=receipt,
+                    )
+
+                # If latest nonce has moved beyond ours, some transaction already consumed
+                # the nonce.  Without a known receipt we cannot prove whether value moved.
+                if nonce_consumed(client, payment.from_address, nonce):
+                    return make_outcome(
+                        payment, started, ok=False, state="unknown",
+                        reason="resume_nonce_already_consumed_but_known_receipt_missing; manual_check_required",
+                        nonce=nonce, tx_hash=tx_hashes[-1] if tx_hashes else None, tx_hashes=tuple(tx_hashes),
+                    )
+
+                if not config.retry_unresolved:
+                    return make_outcome(
+                        payment, started, ok=False, state="pending",
+                        reason="unresolved_previous_attempt_not_rebroadcast",
+                        nonce=nonce, tx_hash=tx_hashes[-1] if tx_hashes else None, tx_hashes=tuple(tx_hashes),
+                    )
+
+                if resume_info.last_fees is None:
+                    return make_outcome(
+                        payment, started, ok=False, state="unknown",
+                        reason="cannot_replace_unresolved_attempt_without_journaled_fees",
+                        nonce=nonce, tx_hash=tx_hashes[-1] if tx_hashes else None, tx_hashes=tuple(tx_hashes),
+                    )
+
+                fees = dict(resume_info.last_fees)
+                first_replacement_index = resume_info.last_replacement_index + 1
+                # Every recovery transmission is a fee bump over the last signed attempt.
+                bump_before_first = True
+            else:
+                nonce = int(client.eth.get_transaction_count(payment.from_address, "pending"))
+                fees = initial_fees(client, config)
+                first_replacement_index = 0
+                bump_before_first = False
+
+            if first_replacement_index > config.max_replacements:
+                pending = nonce_present_in_pending_chain(client, payment.from_address, nonce)
+                return make_outcome(
+                    payment, started, ok=False, state="pending" if pending else "unknown",
+                    reason="replacement_limit_already_reached_before_resume",
+                    nonce=nonce, tx_hash=tx_hashes[-1] if tx_hashes else None, tx_hashes=tuple(tx_hashes),
+                )
+
+            for replacement_index in range(first_replacement_index, config.max_replacements + 1):
+                if STOP.is_set():
+                    return make_outcome(
+                        payment, started, ok=False,
+                        state="pending" if tx_hashes else "stopped",
+                        reason="shutdown_requested_after_broadcast" if tx_hashes else "shutdown_requested",
+                        nonce=nonce, tx_hash=tx_hashes[-1] if tx_hashes else None, tx_hashes=tuple(tx_hashes),
+                    )
+
+                if bump_before_first or replacement_index > first_replacement_index:
                     fees = bump_fees(client, fees, config)
+                bump_before_first = False
 
                 tx = build_transaction(client, payment, nonce, fees, config)
-                balance = int(client.eth.get_balance(payment.from_address, "pending"))
+
+                # Use latest balance here. "pending" balance may already subtract the
+                # transaction being replaced and can falsely report insufficient funds.
+                balance = int(client.eth.get_balance(payment.from_address, "latest"))
                 required = maximum_cost(tx)
                 if balance < required:
                     return make_outcome(
-                        payment,
-                        started,
-                        ok=False,
-                        state="failed",
-                        reason=f"insufficient_funds: need={required}, have={balance}",
-                        nonce=nonce,
-                        tx_hash=tx_hashes[-1] if tx_hashes else None,
-                        tx_hashes=tuple(tx_hashes),
+                        payment, started, ok=False,
+                        state="unknown" if tx_hashes else "failed",
+                        reason=f"insufficient_funds_for_max_cost: need={required}, have={balance}",
+                        nonce=nonce, tx_hash=tx_hashes[-1] if tx_hashes else None, tx_hashes=tuple(tx_hashes),
                     )
 
                 if config.dry_run:
                     return make_outcome(
-                        payment,
-                        started,
-                        ok=True,
-                        state="dry_run",
-                        reason="transaction_built_not_broadcast",
-                        nonce=nonce,
-                        dry_run_tx=jsonable(tx),
+                        payment, started, ok=True, state="dry_run",
+                        reason="transaction_built_not_broadcast", nonce=nonce, dry_run_tx=jsonable(tx),
                     )
 
                 signed = client.eth.account.sign_transaction(tx, payment.private_key)
                 raw = raw_transaction(signed)
                 expected_hash = normalize_tx_hash(Web3.keccak(raw))
 
-                # Persist the deterministic transaction identity *before* touching RPC.
-                # A process crash after RPC acceptance can therefore never erase the hash.
                 if expected_hash not in tx_hashes:
                     tx_hashes.append(expected_hash)
                 append_attempt_event(
-                    config,
-                    payment,
-                    state="signed",
-                    nonce=nonce,
-                    tx_hash=expected_hash,
-                    fees=fees,
-                    gas=int(tx["gas"]),
-                    replacement_index=replacement_index,
+                    config, payment, state="signed", nonce=nonce, tx_hash=expected_hash,
+                    fees=fees, gas=int(tx["gas"]), replacement_index=replacement_index,
                     detail="signed_before_broadcast",
                 )
 
                 try:
                     tx_hash = broadcast_signed(client, raw, expected_hash, config)
                     append_attempt_event(
-                        config,
-                        payment,
-                        state="broadcast",
-                        nonce=nonce,
-                        tx_hash=tx_hash,
-                        fees=fees,
-                        gas=int(tx["gas"]),
-                        replacement_index=replacement_index,
+                        config, payment, state="broadcast", nonce=nonce, tx_hash=tx_hash,
+                        fees=fees, gas=int(tx["gas"]), replacement_index=replacement_index,
                         detail="rpc_acknowledged_or_transaction_known",
                     )
                 except Exception as exc:
                     message = str(exc).lower()
-
-                    # Critical safety rule: never switch to a fresh nonce for the same payment.
-                    # If this nonce has moved, the original transaction may have been accepted.
-                    if "nonce too low" in message:
+                    found_hash, receipt = find_known_receipt(client, tx_hashes, config)
+                    if receipt:
+                        status = int(receipt.get("status", 0))
+                        return make_outcome(
+                            payment, started, ok=status == 1,
+                            state="confirmed" if status == 1 else "reverted",
+                            reason="confirmed_after_broadcast_error" if status == 1 else "transaction_reverted",
+                            nonce=nonce, tx_hash=found_hash, tx_hashes=tuple(tx_hashes), receipt=receipt,
+                        )
+                    if "nonce too low" in message or nonce_consumed(client, payment.from_address, nonce):
                         found_hash, receipt = wait_for_receipt(
-                            client,
-                            [*tx_hashes, expected_hash],
-                            config.final_pending_wait,
-                            config,
+                            client, tx_hashes, config.final_pending_wait, config
                         )
                         if receipt:
                             status = int(receipt.get("status", 0))
                             return make_outcome(
-                                payment,
-                                started,
-                                ok=status == 1,
+                                payment, started, ok=status == 1,
                                 state="confirmed" if status == 1 else "reverted",
-                                reason="confirmed_after_nonce_too_low" if status == 1 else "transaction_reverted",
-                                nonce=nonce,
-                                tx_hash=found_hash,
-                                tx_hashes=tuple(dict.fromkeys([*tx_hashes, expected_hash])),
-                                receipt=receipt,
+                                reason="confirmed_after_nonce_advance" if status == 1 else "transaction_reverted",
+                                nonce=nonce, tx_hash=found_hash, tx_hashes=tuple(tx_hashes), receipt=receipt,
                             )
-                        if nonce_consumed(client, payment.from_address, nonce):
-                            return make_outcome(
-                                payment,
-                                started,
-                                ok=False,
-                                state="unknown",
-                                reason="nonce_consumed_but_receipt_not_found; do_not_resend_automatically",
-                                nonce=nonce,
-                                tx_hash=tx_hashes[-1] if tx_hashes else expected_hash,
-                                tx_hashes=tuple(dict.fromkeys([*tx_hashes, expected_hash])),
-                            )
-                    raise
+                        return make_outcome(
+                            payment, started, ok=False, state="unknown",
+                            reason="nonce_consumed_but_known_receipt_missing; do_not_resend_automatically",
+                            nonce=nonce, tx_hash=tx_hashes[-1], tx_hashes=tuple(tx_hashes),
+                        )
+                    # Once a transaction is signed and journaled, an ambiguous RPC failure
+                    # is unresolved. Do not advance to another fee/nonce automatically.
+                    return make_outcome(
+                        payment, started, ok=False, state="unknown",
+                        reason=f"broadcast_uncertain: {type(exc).__name__}: {exc}",
+                        nonce=nonce, tx_hash=expected_hash, tx_hashes=tuple(tx_hashes),
+                    )
 
                 if tx_hash not in tx_hashes:
                     tx_hashes.append(tx_hash)
                 logger.info(
                     "%s -> %s | value=%s | nonce=%s | broadcast=%s/%s | hash=%s",
-                    short(payment.from_address),
-                    short(payment.to_address),
-                    payment.value_eth,
-                    nonce,
-                    replacement_index + 1,
-                    config.max_replacements + 1,
-                    tx_hash,
+                    short(payment.from_address), short(payment.to_address), payment.value_eth, nonce,
+                    replacement_index + 1, config.max_replacements + 1, tx_hash,
                 )
 
-                found_hash, receipt = wait_for_receipt(
-                    client,
-                    tx_hashes,
-                    config.receipt_timeout,
-                    config,
-                )
+                found_hash, receipt = wait_for_receipt(client, tx_hashes, config.receipt_timeout, config)
                 if receipt:
                     status = int(receipt.get("status", 0))
                     return make_outcome(
-                        payment,
-                        started,
-                        ok=status == 1,
+                        payment, started, ok=status == 1,
                         state="confirmed" if status == 1 else "reverted",
                         reason="confirmed" if status == 1 else "transaction_reverted",
-                        nonce=nonce,
-                        tx_hash=found_hash,
-                        tx_hashes=tuple(tx_hashes),
-                        receipt=receipt,
+                        nonce=nonce, tx_hash=found_hash, tx_hashes=tuple(tx_hashes), receipt=receipt,
                     )
 
-                # If another process replaced/mined this nonce, do not manufacture a new payment.
                 if nonce_consumed(client, payment.from_address, nonce):
-                    found_hash, receipt = wait_for_receipt(
-                        client,
-                        tx_hashes,
-                        config.final_pending_wait,
-                        config,
-                    )
+                    found_hash, receipt = wait_for_receipt(client, tx_hashes, config.final_pending_wait, config)
                     if receipt:
                         status = int(receipt.get("status", 0))
                         return make_outcome(
-                            payment,
-                            started,
-                            ok=status == 1,
+                            payment, started, ok=status == 1,
                             state="confirmed" if status == 1 else "reverted",
                             reason="confirmed_after_delayed_receipt" if status == 1 else "transaction_reverted",
-                            nonce=nonce,
-                            tx_hash=found_hash,
-                            tx_hashes=tuple(tx_hashes),
-                            receipt=receipt,
+                            nonce=nonce, tx_hash=found_hash, tx_hashes=tuple(tx_hashes), receipt=receipt,
                         )
                     return make_outcome(
-                        payment,
-                        started,
-                        ok=False,
-                        state="unknown",
+                        payment, started, ok=False, state="unknown",
                         reason="nonce_mined_but_known_receipt_missing; manual_check_required",
-                        nonce=nonce,
-                        tx_hash=tx_hashes[-1],
-                        tx_hashes=tuple(tx_hashes),
+                        nonce=nonce, tx_hash=tx_hashes[-1], tx_hashes=tuple(tx_hashes),
                     )
 
                 if replacement_index < config.max_replacements:
                     logger.warning(
                         "%s | receipt timeout; replacing same nonce=%s with higher fee",
-                        short(payment.from_address),
-                        nonce,
+                        short(payment.from_address), nonce,
                     )
 
             pending = nonce_present_in_pending_chain(client, payment.from_address, nonce)
             return make_outcome(
-                payment,
-                started,
-                ok=False,
-                state="pending" if pending else "unknown",
+                payment, started, ok=False, state="pending" if pending else "unknown",
                 reason=(
                     "replacement_limit_reached; transaction_still_pending"
-                    if pending
-                    else "replacement_limit_reached; transaction_not_visible"
+                    if pending else "replacement_limit_reached; transaction_not_visible"
                 ),
-                nonce=nonce,
-                tx_hash=tx_hashes[-1] if tx_hashes else None,
-                tx_hashes=tuple(tx_hashes),
+                nonce=nonce, tx_hash=tx_hashes[-1] if tx_hashes else None, tx_hashes=tuple(tx_hashes),
             )
 
         except InterruptedError:
             return make_outcome(
-                payment,
-                started,
-                ok=False,
-                state="pending" if tx_hashes else "stopped",
+                payment, started, ok=False, state="pending" if tx_hashes else "stopped",
                 reason="shutdown_requested_after_broadcast" if tx_hashes else "shutdown_requested",
-                nonce=nonce,
-                tx_hash=tx_hashes[-1] if tx_hashes else None,
-                tx_hashes=tuple(tx_hashes),
+                nonce=nonce, tx_hash=tx_hashes[-1] if tx_hashes else None, tx_hashes=tuple(tx_hashes),
             )
         except Exception as exc:
             logger.exception("%s | payment failed: %s", short(payment.from_address), exc)
             return make_outcome(
-                payment,
-                started,
-                ok=False,
-                state="failed" if not tx_hashes else "unknown",
-                reason=f"{type(exc).__name__}: {exc}",
-                nonce=nonce,
-                tx_hash=tx_hashes[-1] if tx_hashes else None,
-                tx_hashes=tuple(tx_hashes),
+                payment, started, ok=False, state="failed" if not tx_hashes else "unknown",
+                reason=f"{type(exc).__name__}: {exc}", nonce=nonce,
+                tx_hash=tx_hashes[-1] if tx_hashes else None, tx_hashes=tuple(tx_hashes),
             )
 
 
@@ -990,53 +1119,77 @@ def run(payments: list[Payment], config: Config) -> dict[str, Any]:
     journal_path = Path(config.journal_file)
     skipped_completed = 0
     skipped_unresolved = 0
+    resume_map: dict[str, ResumeInfo] = {}
+
     if config.resume:
-        completed_ids, unresolved_ids = load_resume_sets(journal_path)
-        before = len(payments)
-        skipped_completed = sum(p.payment_id in completed_ids for p in payments)
-        skipped_unresolved = sum(p.payment_id in unresolved_ids for p in payments)
-        blocked = completed_ids | (set() if config.retry_unresolved else unresolved_ids)
-        payments = [p for p in payments if p.payment_id not in blocked]
+        resume_index = load_resume_index(journal_path)
+        runnable: list[Payment] = []
+        for payment in payments:
+            info = resume_index.get(payment.payment_id)
+            if info is None:
+                runnable.append(payment)
+                continue
+            if not payment_matches_resume(payment, info):
+                raise ValueError(
+                    f"Payment ID {payment.payment_id!r} already exists in journal with different "
+                    "from/to/value data; use a new external id or a different journal"
+                )
+            cls = resume_class(info)
+            if cls == "completed":
+                skipped_completed += 1
+                continue
+            if cls == "unresolved" and not config.retry_unresolved:
+                skipped_unresolved += 1
+                continue
+            runnable.append(payment)
+            if cls == "unresolved":
+                resume_map[payment.payment_id] = info
+
+        payments = runnable
         logger.info(
             "Resume: skipped completed=%s unresolved=%s retry_unresolved=%s",
-            skipped_completed,
-            0 if config.retry_unresolved else skipped_unresolved,
-            config.retry_unresolved,
+            skipped_completed, skipped_unresolved, config.retry_unresolved,
         )
-        if unresolved_ids and not config.retry_unresolved:
+        if skipped_unresolved:
             logger.warning(
                 "%s unresolved payment(s) were not resent automatically. "
-                "Inspect journal/chain; use --retry-unresolved only after verification.",
+                "Use --retry-unresolved only to replace the SAME nonce after chain verification.",
                 skipped_unresolved,
             )
 
-    total = len(payments)
+    total_planned = len(payments)
     counters: dict[str, int] = {}
     started = time.monotonic()
 
-    if total == 0:
+    if total_planned == 0:
         logger.info("Nothing to send")
-        return {"total": 0, "duration_seconds": 0.0, "states": {}, "skipped_completed": skipped_completed, "skipped_unresolved": skipped_unresolved}
+        summary = {
+            "total": 0, "submitted": 0, "duration_seconds": 0.0, "states": {},
+            "skipped_completed": skipped_completed, "skipped_unresolved": skipped_unresolved,
+            "journal_file": str(journal_path), "stopped": STOP.is_set(), "timestamp": time.time(),
+        }
+        with SUMMARY_LOCK:
+            atomic_write_json(Path(config.summary_file), summary)
+        return summary
 
     logger.info(
         "Starting | payments=%s | workers=%s | dry_run=%s | journal=%s",
-        total,
-        config.max_workers,
-        config.dry_run,
-        journal_path,
+        total_planned, config.max_workers, config.dry_run, journal_path,
     )
 
     executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=config.max_workers,
-        thread_name_prefix="sender",
+        max_workers=config.max_workers, thread_name_prefix="sender"
     )
     futures: dict[concurrent.futures.Future[Outcome], Payment] = {}
     try:
         for payment in payments:
             if STOP.is_set():
                 break
-            futures[executor.submit(send_payment, payment, config)] = payment
+            futures[executor.submit(
+                send_payment, payment, config, resume_map.get(payment.payment_id)
+            )] = payment
 
+        submitted = len(futures)
         completed = 0
         for future in concurrent.futures.as_completed(futures):
             payment = futures[future]
@@ -1045,28 +1198,20 @@ def run(payments: list[Payment], config: Config) -> dict[str, Any]:
             except Exception as exc:
                 logger.exception("Worker crashed for payment=%s: %s", payment.payment_id, exc)
                 outcome = make_outcome(
-                    payment,
-                    time.monotonic(),
-                    ok=False,
-                    state="failed",
+                    payment, time.monotonic(), ok=False, state="failed",
                     reason=f"worker_crashed: {type(exc).__name__}: {exc}",
                 )
 
-            append_jsonl(journal_path, asdict(outcome))
+            append_jsonl(journal_path, {"record_type": "outcome", **asdict(outcome)})
             completed += 1
             counters[outcome.state] = counters.get(outcome.state, 0) + 1
 
             elapsed = time.monotonic() - started
             rate = completed / elapsed if elapsed > 0 else 0.0
-            eta = (total - completed) / rate if rate > 0 else 0.0
+            eta = (submitted - completed) / rate if rate > 0 else 0.0
             logger.info(
                 "Progress %s/%s | state=%s | rate=%.2f/s | eta=%.1fs | counts=%s",
-                completed,
-                total,
-                outcome.state,
-                rate,
-                eta,
-                counters,
+                completed, submitted, outcome.state, rate, eta, counters,
             )
 
             if STOP.is_set():
@@ -1077,7 +1222,8 @@ def run(payments: list[Payment], config: Config) -> dict[str, Any]:
         executor.shutdown(wait=True, cancel_futures=True)
 
     summary = {
-        "total": total,
+        "total": total_planned,
+        "submitted": len(futures),
         "duration_seconds": round(time.monotonic() - started, 3),
         "states": dict(sorted(counters.items())),
         "skipped_completed": skipped_completed,
@@ -1108,7 +1254,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--retry-unresolved",
         action="store_true",
-        help="Allow resend of payments whose previous signed/broadcast attempt is unresolved (dangerous)",
+        help="Recover unresolved payments by replacing the SAME nonce only; never allocates a fresh nonce",
     )
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parser.parse_args()
