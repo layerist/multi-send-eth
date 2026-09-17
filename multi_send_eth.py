@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Reliable EVM native-coin batch sender v4.
+Reliable EVM native-coin batch sender v5.
 
 Design goals:
 - one payment is never silently re-sent with a new nonce after broadcasting;
-- transactions from the same source address are serialized;
+- transactions from the same source address are serialized in deterministic input order;
 - EIP-1559 and legacy fee support with explicit fee caps;
 - append-only JSONL journal (no O(n²) rewrites);
-- crash-safe resumable runs using deterministic payment IDs and pre-broadcast journaling;
+- crash-safe resumable runs using deterministic payment IDs, chain-bound journals and pre-broadcast journaling;
+- unresolved resumed payments block later payments from the same source;
 - graceful shutdown and clear "pending/unknown" outcomes;
 - private keys are never written to logs or result files.
 
@@ -194,6 +195,7 @@ class Payment:
 @dataclass(frozen=True)
 class ResumeInfo:
     payment_id: str
+    chain_id: Optional[int]
     last_state: str
     nonce: Optional[int]
     tx_hashes: tuple[str, ...]
@@ -295,8 +297,8 @@ def source_is_blocked(address: str) -> bool:
         return address.lower() in BLOCKED_SOURCES
 
 
-def payment_fingerprint(from_address: str, to_address: str, value_wei: int, external_id: str = "") -> str:
-    canonical = f"{from_address.lower()}|{to_address.lower()}|{value_wei}|{external_id.strip()}"
+def payment_fingerprint(chain_id: int, from_address: str, to_address: str, value_wei: int, external_id: str = "") -> str:
+    canonical = f"{chain_id}|{from_address.lower()}|{to_address.lower()}|{value_wei}|{external_id.strip()}"
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -431,6 +433,7 @@ def load_resume_index(path: Path) -> dict[str, ResumeInfo]:
                 payment_id,
                 {
                     "last": None,
+                    "chain_id": None,
                     "by_nonce": {},
                     "from_address": None,
                     "to_address": None,
@@ -438,6 +441,8 @@ def load_resume_index(path: Path) -> dict[str, ResumeInfo]:
                 },
             )
             bucket["last"] = item
+            if item.get("chain_id") is not None:
+                bucket["chain_id"] = int(item["chain_id"])
             nonce_value = item.get("nonce")
             if nonce_value is not None:
                 nonce = int(nonce_value)
@@ -469,6 +474,7 @@ def load_resume_index(path: Path) -> dict[str, ResumeInfo]:
         nonce_bucket = bucket["by_nonce"].get(nonce, {}) if nonce is not None else {}
         result[payment_id] = ResumeInfo(
             payment_id=payment_id,
+            chain_id=bucket.get("chain_id"),
             last_state=str(last.get("state", "")),
             nonce=nonce,
             tx_hashes=tuple(nonce_bucket.get("hashes", [])),
@@ -481,10 +487,11 @@ def load_resume_index(path: Path) -> dict[str, ResumeInfo]:
     return result
 
 
-def payment_matches_resume(payment: Payment, info: ResumeInfo) -> bool:
+def payment_matches_resume(payment: Payment, info: ResumeInfo, config: Config) -> bool:
     """Protect an external payment ID from being accidentally reused for new payment data."""
     return (
-        (info.from_address is None or info.from_address.lower() == payment.from_address.lower())
+        (info.chain_id is None or info.chain_id == config.chain_id)
+        and (info.from_address is None or info.from_address.lower() == payment.from_address.lower())
         and (info.to_address is None or info.to_address.lower() == payment.to_address.lower())
         and (info.value_wei is None or info.value_wei == payment.value_wei)
     )
@@ -520,6 +527,7 @@ def append_attempt_event(
         Path(config.journal_file),
         {
             "record_type": "attempt",
+            "chain_id": config.chain_id,
             "payment_id": payment.payment_id,
             "state": state,
             "detail": detail,
@@ -599,7 +607,7 @@ def parse_payment(item: Any, index: int, config: Config) -> Payment:
         raise ValueError("private key does not match from_address")
 
     external_id = str(item.get("id", "")).strip()
-    payment_id = external_id or payment_fingerprint(from_address, to_address, value_wei)
+    payment_id = external_id or payment_fingerprint(config.chain_id, from_address, to_address, value_wei)
 
     return Payment(
         payment_id=payment_id,
@@ -887,7 +895,7 @@ def send_payment(
         nonce: Optional[int] = None
         tx_hashes: list[str] = list(resume_info.tx_hashes) if resume_info else []
         try:
-            if resume_info and not payment_matches_resume(payment, resume_info):
+            if resume_info and not payment_matches_resume(payment, resume_info, config):
                 return make_outcome(
                     payment, started, ok=False, state="failed",
                     reason="payment_id_reused_with_different_payment_data",
@@ -1115,6 +1123,28 @@ def send_payment(
 # =============================================================================
 
 
+def run_source_batch(
+    source_payments: list[Payment],
+    config: Config,
+    resume_map: Mapping[str, ResumeInfo],
+) -> list[Outcome]:
+    """Process one source in input order; different sources may run concurrently."""
+    outcomes: list[Outcome] = []
+    for payment in source_payments:
+        if STOP.is_set():
+            outcomes.append(make_outcome(
+                payment, time.monotonic(), ok=False, state="stopped",
+                reason="shutdown_requested_before_payment",
+            ))
+            continue
+        outcome = send_payment(payment, config, resume_map.get(payment.payment_id))
+        outcomes.append(outcome)
+        if outcome.state in {"pending", "unknown"}:
+            # Do not allocate higher nonces behind an unresolved transaction.
+            mark_source_blocked(payment.from_address)
+    return outcomes
+
+
 def run(payments: list[Payment], config: Config) -> dict[str, Any]:
     journal_path = Path(config.journal_file)
     skipped_completed = 0
@@ -1129,7 +1159,7 @@ def run(payments: list[Payment], config: Config) -> dict[str, Any]:
             if info is None:
                 runnable.append(payment)
                 continue
-            if not payment_matches_resume(payment, info):
+            if not payment_matches_resume(payment, info, config):
                 raise ValueError(
                     f"Payment ID {payment.payment_id!r} already exists in journal with different "
                     "from/to/value data; use a new external id or a different journal"
@@ -1138,21 +1168,23 @@ def run(payments: list[Payment], config: Config) -> dict[str, Any]:
             if cls == "completed":
                 skipped_completed += 1
                 continue
-            if cls == "unresolved" and not config.retry_unresolved:
-                skipped_unresolved += 1
-                continue
             runnable.append(payment)
             if cls == "unresolved":
+                # Always route unresolved entries through send_payment. With
+                # retry_unresolved=False it performs chain checks but does not rebroadcast,
+                # then blocks later payments from the same source in this run.
                 resume_map[payment.payment_id] = info
+                if not config.retry_unresolved:
+                    skipped_unresolved += 1
 
         payments = runnable
         logger.info(
-            "Resume: skipped completed=%s unresolved=%s retry_unresolved=%s",
+            "Resume: skipped completed=%s unresolved_not_rebroadcast=%s retry_unresolved=%s",
             skipped_completed, skipped_unresolved, config.retry_unresolved,
         )
         if skipped_unresolved:
             logger.warning(
-                "%s unresolved payment(s) were not resent automatically. "
+                "%s unresolved payment(s) will be checked but not resent automatically. "
                 "Use --retry-unresolved only to replace the SAME nonce after chain verification.",
                 skipped_unresolved,
             )
@@ -1177,53 +1209,64 @@ def run(payments: list[Payment], config: Config) -> dict[str, Any]:
         total_planned, config.max_workers, config.dry_run, journal_path,
     )
 
+    # One future per source preserves deterministic nonce order while still
+    # allowing independent source wallets to run in parallel.
+    grouped: dict[str, list[Payment]] = {}
+    for payment in payments:
+        grouped.setdefault(payment.from_address.lower(), []).append(payment)
+    for group in grouped.values():
+        group.sort(key=lambda p: p.source_index)
+
     executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=config.max_workers, thread_name_prefix="sender"
+        max_workers=min(config.max_workers, max(1, len(grouped))),
+        thread_name_prefix="sender",
     )
-    futures: dict[concurrent.futures.Future[Outcome], Payment] = {}
+    futures: dict[concurrent.futures.Future[list[Outcome]], list[Payment]] = {}
+    submitted = 0
     try:
-        for payment in payments:
+        for source_payments in grouped.values():
             if STOP.is_set():
                 break
-            futures[executor.submit(
-                send_payment, payment, config, resume_map.get(payment.payment_id)
-            )] = payment
+            future = executor.submit(run_source_batch, source_payments, config, resume_map)
+            futures[future] = source_payments
+            submitted += len(source_payments)
 
-        submitted = len(futures)
         completed = 0
         for future in concurrent.futures.as_completed(futures):
-            payment = futures[future]
+            source_payments = futures[future]
             try:
-                outcome = future.result()
+                outcomes = future.result()
             except Exception as exc:
-                logger.exception("Worker crashed for payment=%s: %s", payment.payment_id, exc)
-                outcome = make_outcome(
-                    payment, time.monotonic(), ok=False, state="failed",
-                    reason=f"worker_crashed: {type(exc).__name__}: {exc}",
+                logger.exception("Source worker crashed for %s: %s", short(source_payments[0].from_address), exc)
+                outcomes = [
+                    make_outcome(
+                        payment, time.monotonic(), ok=False, state="failed",
+                        reason=f"source_worker_crashed: {type(exc).__name__}: {exc}",
+                    )
+                    for payment in source_payments
+                ]
+
+            for outcome in outcomes:
+                append_jsonl(journal_path, {"record_type": "outcome", "chain_id": config.chain_id, **asdict(outcome)})
+                completed += 1
+                counters[outcome.state] = counters.get(outcome.state, 0) + 1
+                elapsed = time.monotonic() - started
+                rate = completed / elapsed if elapsed > 0 else 0.0
+                eta = (submitted - completed) / rate if rate > 0 else 0.0
+                logger.info(
+                    "Progress %s/%s | state=%s | rate=%.2f/s | eta=%.1fs | counts=%s",
+                    completed, submitted, outcome.state, rate, eta, counters,
                 )
-
-            append_jsonl(journal_path, {"record_type": "outcome", **asdict(outcome)})
-            completed += 1
-            counters[outcome.state] = counters.get(outcome.state, 0) + 1
-
-            elapsed = time.monotonic() - started
-            rate = completed / elapsed if elapsed > 0 else 0.0
-            eta = (submitted - completed) / rate if rate > 0 else 0.0
-            logger.info(
-                "Progress %s/%s | state=%s | rate=%.2f/s | eta=%.1fs | counts=%s",
-                completed, submitted, outcome.state, rate, eta, counters,
-            )
 
             if STOP.is_set():
                 for pending_future in futures:
                     pending_future.cancel()
-
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
     summary = {
         "total": total_planned,
-        "submitted": len(futures),
+        "submitted": submitted,
         "duration_seconds": round(time.monotonic() - started, 3),
         "states": dict(sorted(counters.items())),
         "skipped_completed": skipped_completed,
