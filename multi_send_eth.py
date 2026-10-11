@@ -31,11 +31,13 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import signal
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
@@ -117,6 +119,15 @@ class Config:
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
     def validate(self) -> None:
+        for name in (
+            "min_bump_gwei", "priority_fee_gwei", "max_fee_multiplier",
+            "max_fee_cap_gwei", "gas_safety_multiplier",
+        ):
+            if not getattr(self, name).is_finite():
+                raise ValueError(f"{name.upper()} must be finite")
+        for name in ("receipt_timeout", "receipt_poll", "final_pending_wait", "rpc_timeout"):
+            if not math.isfinite(getattr(self, name)):
+                raise ValueError(f"{name.upper()} must be finite")
         if self.chain_id <= 0:
             raise ValueError("CHAIN_ID must be positive")
         if self.max_workers <= 0:
@@ -236,7 +247,8 @@ def interruptible_sleep(seconds: float) -> bool:
 
 
 def backoff(attempt: int, cap: float = 20.0) -> float:
-    return min(cap, 0.75 * (2**attempt)) + random.uniform(0.05, 0.5)
+    # Saturate the exponent: an extreme retry count must not overflow a float.
+    return min(cap, 0.75 * (2 ** min(max(attempt, 0), 20))) + random.uniform(0.05, 0.5)
 
 
 def short(address: str) -> str:
@@ -393,6 +405,46 @@ def verify_connection(config: Config) -> None:
 # =============================================================================
 
 
+@contextmanager
+def journal_run_lock(journal_path: Path) -> Iterable[None]:
+    """Hold a cross-process, crash-released lock for the whole run.
+
+    A separate lock file is used so append-only journal writes stay independent.
+    On both Windows and POSIX, the operating system releases the lock after a crash.
+    """
+    lock_path = journal_path.with_name(journal_path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"1")
+                handle.flush()
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise RuntimeError(f"Journal is already in use: {journal_path}") from exc
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise RuntimeError(f"Journal is already in use: {journal_path}") from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(jsonable(dict(record)), ensure_ascii=False, separators=(",", ":"))
@@ -421,13 +473,15 @@ def load_resume_index(path: Path) -> dict[str, ResumeInfo]:
                 continue
             try:
                 item = json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning("Ignoring invalid journal line %s", line_no)
-                continue
+            except json.JSONDecodeError as exc:
+                # Skipping a damaged payment record can cause a duplicate on resume.
+                raise ValueError(f"Invalid JSON in journal line {line_no}; inspect before resuming") from exc
+            if not isinstance(item, dict):
+                raise ValueError(f"Invalid journal record at line {line_no}: expected object")
 
             payment_id = item.get("payment_id")
             if not payment_id:
-                continue
+                raise ValueError(f"Journal record at line {line_no} has no payment_id")
             payment_id = str(payment_id)
             bucket = grouped.setdefault(
                 payment_id,
@@ -498,10 +552,12 @@ def payment_matches_resume(payment: Payment, info: ResumeInfo, config: Config) -
 
 
 def resume_class(info: ResumeInfo) -> str:
-    if info.last_state in {"confirmed", "dry_run"}:
+    if info.last_state == "confirmed":
         return "completed"
     if info.last_state == "reverted":
         return "retryable"
+    # A simulation never settles a payment. It must not prevent the real send.
+    # If a dry run followed real signed attempts, those attempts are still unresolved.
     if info.tx_hashes or info.last_state in {"signed", "broadcast", "pending", "unknown"}:
         return "unresolved"
     return "retryable"
@@ -593,10 +649,14 @@ def parse_payment(item: Any, index: int, config: Config) -> Payment:
     if not value_eth.is_finite() or value_eth <= 0:
         raise ValueError("value must be a finite positive number")
 
-    value_wei_decimal = value_eth * Decimal(10**18)
-    if value_wei_decimal != value_wei_decimal.to_integral_value():
+    # Convert exactly, without Decimal's default 28-digit arithmetic context
+    # silently rounding very large or high-precision transfer amounts.
+    numerator, denominator = value_eth.as_integer_ratio()
+    value_wei, remainder = divmod(numerator * 10**18, denominator)
+    if remainder:
         raise ValueError("value has more than 18 decimal places")
-    value_wei = int(value_wei_decimal)
+    if value_wei >= 2**256:
+        raise ValueError("value exceeds the maximum EVM uint256 amount")
 
     private_key = str(item["private_key"]).strip()
     try:
@@ -1146,6 +1206,13 @@ def run_source_batch(
 
 
 def run(payments: list[Payment], config: Config) -> dict[str, Any]:
+    # Lock before reading resume state: concurrent runs must never choose a nonce
+    # from the same journal based on a stale snapshot.
+    with journal_run_lock(Path(config.journal_file)):
+        return _run_locked(payments, config)
+
+
+def _run_locked(payments: list[Payment], config: Config) -> dict[str, Any]:
     journal_path = Path(config.journal_file)
     skipped_completed = 0
     skipped_unresolved = 0
@@ -1153,6 +1220,61 @@ def run(payments: list[Payment], config: Config) -> dict[str, Any]:
 
     if config.resume:
         resume_index = load_resume_index(journal_path)
+        # A journal belongs to exactly one chain. Reusing it for another chain
+        # can hide earlier broadcasts and lead to duplicate or incorrect sends.
+        other_chains = {
+            info.chain_id for info in resume_index.values()
+            if info.chain_id is not None and info.chain_id != config.chain_id
+        }
+        if other_chains:
+            raise ValueError(
+                f"Journal belongs to chain(s) {sorted(other_chains)}, not CHAIN_ID={config.chain_id}"
+            )
+
+        # A pending transaction from an earlier batch may no longer be present
+        # in the current wallets file. Fail closed instead of moving its sender's
+        # nonce forward. Also require recovery attempts to precede new payments.
+        indexed_by_id = {payment.payment_id: payment for payment in payments}
+        active_sources = {payment.from_address.lower() for payment in payments}
+        unresolved_by_source: dict[str, list[ResumeInfo]] = {}
+        for info in resume_index.values():
+            if resume_class(info) != "unresolved":
+                continue
+            if not info.from_address or info.chain_id is None:
+                raise ValueError(
+                    f"Unresolved journal payment {info.payment_id!r} lacks chain/source identity"
+                )
+            source = info.from_address.lower()
+            if source in active_sources:
+                if info.payment_id not in indexed_by_id:
+                    raise ValueError(
+                        f"Unresolved previous payment {info.payment_id!r} from {info.from_address} "
+                        "is absent from wallets file; restore it before sending from that source"
+                    )
+                unresolved_by_source.setdefault(source, []).append(info)
+
+        for source, infos in unresolved_by_source.items():
+            source_payments = [
+                p for p in payments
+                if p.from_address.lower() == source
+                and (p.payment_id not in resume_index
+                     or resume_class(resume_index[p.payment_id]) != "completed")
+            ]
+            unresolved_ids = {info.payment_id for info in infos}
+            leading_ids = {p.payment_id for p in source_payments[:len(unresolved_ids)]}
+            if leading_ids != unresolved_ids:
+                raise ValueError(
+                    f"Unresolved payments from {source} must appear before new payments "
+                    "from that address in wallets file"
+                )
+            if len(infos) > 1:
+                ordered = [p.payment_id for p in source_payments if p.payment_id in unresolved_ids]
+                expected = [info.payment_id for info in sorted(infos, key=lambda i: (i.nonce is None, i.nonce or 0))]
+                if ordered != expected or any(info.nonce is None for info in infos):
+                    raise ValueError(
+                        f"Multiple unresolved payments from {source} need manual nonce/order review"
+                    )
+
         runnable: list[Payment] = []
         for payment in payments:
             info = resume_index.get(payment.payment_id)
