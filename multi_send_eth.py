@@ -215,6 +215,7 @@ class ResumeInfo:
     from_address: Optional[str]
     to_address: Optional[str]
     value_wei: Optional[int]
+    last_gas: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -487,6 +488,7 @@ def load_resume_index(path: Path) -> dict[str, ResumeInfo]:
                 payment_id,
                 {
                     "last": None,
+                    "last_with_nonce": None,
                     "chain_id": None,
                     "by_nonce": {},
                     "from_address": None,
@@ -494,15 +496,47 @@ def load_resume_index(path: Path) -> dict[str, ResumeInfo]:
                     "value_wei": None,
                 },
             )
+            # Never let a later entry silently change the chain or identity of an
+            # existing payment. The previous behavior trusted the last value,
+            # potentially treating a mixed/corrupt journal as safely completed.
+            if item.get("chain_id") is None:
+                raise ValueError(f"Journal record at line {line_no} has no chain_id")
+            try:
+                chain_id = int(item["chain_id"])
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ValueError(f"Invalid chain_id in journal line {line_no}") from exc
+            if chain_id <= 0:
+                raise ValueError(f"Invalid chain_id in journal line {line_no}")
+            if bucket["chain_id"] is not None and bucket["chain_id"] != chain_id:
+                raise ValueError(f"Conflicting chain_id for payment {payment_id!r} at line {line_no}")
+            bucket["chain_id"] = chain_id
+
+            for key in ("from_address", "to_address", "value_wei"):
+                value = item.get(key)
+                if value is None:
+                    continue
+                if key == "value_wei":
+                    try:
+                        value = int(value)
+                    except (ValueError, TypeError, OverflowError) as exc:
+                        raise ValueError(f"Invalid value_wei at journal line {line_no}") from exc
+                    if value < 0:
+                        raise ValueError(f"Invalid value_wei at journal line {line_no}")
+                else:
+                    value = str(value).lower()
+                if bucket[key] is not None and bucket[key] != value:
+                    raise ValueError(f"Conflicting {key} for payment {payment_id!r} at line {line_no}")
+                bucket[key] = value
             bucket["last"] = item
-            if item.get("chain_id") is not None:
-                bucket["chain_id"] = int(item["chain_id"])
             nonce_value = item.get("nonce")
             if nonce_value is not None:
                 nonce = int(nonce_value)
+                if nonce < 0:
+                    raise ValueError(f"Invalid nonce in journal line {line_no}")
+                bucket["last_with_nonce"] = item
                 nonce_bucket = bucket["by_nonce"].setdefault(
                     nonce,
-                    {"hashes": [], "last_fees": None, "last_replacement_index": -1},
+                    {"hashes": [], "last_fees": None, "last_replacement_index": -1, "last_gas": None},
                 )
                 tx_hash = item.get("tx_hash") or item.get("expected_hash")
                 if tx_hash and str(tx_hash) not in nonce_bucket["hashes"]:
@@ -516,14 +550,21 @@ def load_resume_index(path: Path) -> dict[str, ResumeInfo]:
                         int(nonce_bucket["last_replacement_index"]),
                         int(item["replacement_index"]),
                     )
-
-            for key in ("from_address", "to_address", "value_wei"):
-                if item.get(key) is not None:
-                    bucket[key] = item[key]
+                if item.get("gas") is not None:
+                    gas = int(item["gas"])
+                    if gas < 21_000:
+                        raise ValueError(f"Invalid gas limit in journal line {line_no}")
+                    nonce_bucket["last_gas"] = gas
 
     result: dict[str, ResumeInfo] = {}
     for payment_id, bucket in grouped.items():
         last = bucket["last"] or {}
+        if last.get("nonce") is None and bucket["last_with_nonce"] is not None:
+            # A later no-nonce event (e.g. STOP before processing a resumed
+            # payment) must not erase an earlier broadcast or its terminal
+            # receipt. Otherwise a pending transfer might be re-sent with a
+            # fresh nonce on the next restart.
+            last = bucket["last_with_nonce"]
         nonce = int(last["nonce"]) if last.get("nonce") is not None else None
         nonce_bucket = bucket["by_nonce"].get(nonce, {}) if nonce is not None else {}
         result[payment_id] = ResumeInfo(
@@ -537,6 +578,7 @@ def load_resume_index(path: Path) -> dict[str, ResumeInfo]:
             from_address=str(bucket["from_address"]) if bucket["from_address"] is not None else None,
             to_address=str(bucket["to_address"]) if bucket["to_address"] is not None else None,
             value_wei=int(bucket["value_wei"]) if bucket["value_wei"] is not None else None,
+            last_gas=nonce_bucket.get("last_gas"),
         )
     return result
 
@@ -798,6 +840,7 @@ def build_transaction(
     nonce: int,
     fees: Mapping[str, int],
     config: Config,
+    gas_limit: Optional[int] = None,
 ) -> dict[str, Any]:
     tx: dict[str, Any] = {
         "chainId": config.chain_id,
@@ -807,7 +850,10 @@ def build_transaction(
         "value": payment.value_wei,
         **dict(fees),
     }
-    tx["gas"] = estimate_gas(client, tx, config)
+    # Replacements of a previously signed transaction retain its gas limit.
+    # Re-estimating a pending same-nonce transaction can fail at some RPC nodes,
+    # and paying to estimate again adds needless RPC traffic.
+    tx["gas"] = gas_limit if gas_limit is not None else estimate_gas(client, tx, config)
     return tx
 
 
@@ -1011,11 +1057,13 @@ def send_payment(
                 first_replacement_index = resume_info.last_replacement_index + 1
                 # Every recovery transmission is a fee bump over the last signed attempt.
                 bump_before_first = True
+                gas_limit = resume_info.last_gas
             else:
                 nonce = int(client.eth.get_transaction_count(payment.from_address, "pending"))
                 fees = initial_fees(client, config)
                 first_replacement_index = 0
                 bump_before_first = False
+                gas_limit = None
 
             if first_replacement_index > config.max_replacements:
                 pending = nonce_present_in_pending_chain(client, payment.from_address, nonce)
@@ -1038,7 +1086,8 @@ def send_payment(
                     fees = bump_fees(client, fees, config)
                 bump_before_first = False
 
-                tx = build_transaction(client, payment, nonce, fees, config)
+                tx = build_transaction(client, payment, nonce, fees, config, gas_limit)
+                gas_limit = int(tx["gas"])
 
                 # Use latest balance here. "pending" balance may already subtract the
                 # transaction being replaced and can falsely report insufficient funds.
@@ -1192,15 +1241,30 @@ def run_source_batch(
     outcomes: list[Outcome] = []
     for payment in source_payments:
         if STOP.is_set():
-            outcomes.append(make_outcome(
+            outcome = make_outcome(
                 payment, time.monotonic(), ok=False, state="stopped",
                 reason="shutdown_requested_before_payment",
-            ))
-            continue
-        outcome = send_payment(payment, config, resume_map.get(payment.payment_id))
+            )
+        else:
+            try:
+                outcome = send_payment(payment, config, resume_map.get(payment.payment_id))
+            except Exception as exc:
+                # An unexpected worker error can happen after a successful RPC
+                # broadcast. Without proof of non-broadcast, fail closed.
+                logger.exception("Unexpected error sending %s: %s", payment.payment_id, exc)
+                outcome = make_outcome(
+                    payment, time.monotonic(), ok=False, state="unknown",
+                    reason=f"unexpected_sender_error: {type(exc).__name__}: {exc}",
+                )
+
+        # Persist each outcome before allowing the next payment of this source
+        # to advance its nonce; never keep a whole batch's results in memory.
+        append_jsonl(
+            Path(config.journal_file),
+            {"record_type": "outcome", "chain_id": config.chain_id, **asdict(outcome)},
+        )
         outcomes.append(outcome)
         if outcome.state in {"pending", "unknown"}:
-            # Do not allocate higher nonces behind an unresolved transaction.
             mark_source_blocked(payment.from_address)
     return outcomes
 
@@ -1356,20 +1420,24 @@ def _run_locked(payments: list[Payment], config: Config) -> dict[str, Any]:
         completed = 0
         for future in concurrent.futures.as_completed(futures):
             source_payments = futures[future]
-            try:
-                outcomes = future.result()
-            except Exception as exc:
-                logger.exception("Source worker crashed for %s: %s", short(source_payments[0].from_address), exc)
+            if future.cancelled():
+                # Cancelled futures never started and therefore contain no
+                # transaction. Journal them as stopped rather than failed.
                 outcomes = [
                     make_outcome(
-                        payment, time.monotonic(), ok=False, state="failed",
-                        reason=f"source_worker_crashed: {type(exc).__name__}: {exc}",
+                        payment, time.monotonic(), ok=False, state="stopped",
+                        reason="shutdown_requested_before_source_started",
                     )
                     for payment in source_payments
                 ]
+                for outcome in outcomes:
+                    append_jsonl(journal_path, {"record_type": "outcome", "chain_id": config.chain_id, **asdict(outcome)})
+            else:
+                # Journal I/O failure in a worker is fatal. Do not fabricate
+                # "failed" outcomes that could hide previously signed attempts.
+                outcomes = future.result()
 
             for outcome in outcomes:
-                append_jsonl(journal_path, {"record_type": "outcome", "chain_id": config.chain_id, **asdict(outcome)})
                 completed += 1
                 counters[outcome.state] = counters.get(outcome.state, 0) + 1
                 elapsed = time.monotonic() - started
@@ -1383,6 +1451,9 @@ def _run_locked(payments: list[Payment], config: Config) -> dict[str, Any]:
             if STOP.is_set():
                 for pending_future in futures:
                     pending_future.cancel()
+    except BaseException:
+        STOP.set()
+        raise
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
@@ -1472,7 +1543,7 @@ def main() -> int:
         summary = run(payments, config)
         # Pending/unknown/reverted/failed are intentionally non-zero.
         bad = sum(summary["states"].get(state, 0) for state in ("failed", "reverted", "unknown", "pending", "stopped"))
-        return 1 if bad else 0
+        return 1 if bad or summary["stopped"] or summary["submitted"] != summary["total"] else 0
     except KeyboardInterrupt:
         STOP.set()
         logger.warning("Interrupted")
